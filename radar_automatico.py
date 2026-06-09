@@ -28,6 +28,20 @@ EMAIL_DESTINO = os.environ.get('EMAIL_DESTINO', '')
 SMTP_HOST = os.environ.get('SMTP_HOST') or 'smtp.gmail.com'
 SMTP_PORT = int(os.environ.get('SMTP_PORT') or '587')
 
+# ─── CAPA DE IA (confirmación de coincidencias con Gemini) ───────────────────
+# El filtro de keywords PRESELECCIONA candidatos; la IA confirma cuáles son
+# coincidencias reales (la norma efectivamente modifica/deroga/crea lo del caso)
+# y descarta las que solo comparten vocabulario. Apagada por defecto: si USAR_IA
+# no es "true", el radar funciona igual que ahora (solo keywords).
+USAR_IA = (os.environ.get('USAR_IA', 'false').lower() == 'true')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+# Modelo configurable. Por defecto el mejor equilibrio dentro del tier gratuito.
+# Alternativas: "gemini-3.5-flash" (más nuevo), "gemini-2.5-flash-lite" (más liviano).
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-flash'
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+IA_DELAY_SEGUNDOS = 1.5      # pausa entre consultas para respetar el límite gratuito
+IA_MAX_CHARS_NORMA = 8000    # recorte del texto de la norma que se manda a la IA
+
 # --- CONFIGURACIÓN GENERAL ---
 NOMBRE_ARCHIVO_BASE = 'seguimiento_desregulacion_estandarizado'
 NOMBRE_HOJA_EXCEL = 'Radar'
@@ -491,6 +505,7 @@ def escanear_boletin():
                     'TEXTO': texto,
                     'TEXTO_NORM': titulo_norm,
                     'TEXTO_MATCH': titulo_norm,   # por defecto = título; se enriquece abajo
+                    'TEXTO_ORIGINAL': texto,      # texto sin normalizar, para la IA
                     'URL': full_url,
                     'TIPO': clasificar_tipo_norma(titulo_norm),
                     'ES_RRHH': es_norma_de_rrhh(titulo_norm),
@@ -513,6 +528,7 @@ def escanear_boletin():
             # Aunque falle el cuerpo, el resumen ya mejora respecto al título solo.
             combinado = f"{norma['TEXTO']} {resumen} {cuerpo}"
             norma['TEXTO_MATCH'] = normalizar_texto(combinado)
+            norma['TEXTO_ORIGINAL'] = combinado   # sin normalizar, para la IA
             if i % 15 == 0:
                 print(f"     ... {i}/{len(sustantivas)} leídas ({fallos} fallidas)")
             time.sleep(BORA_DELAY_SEGUNDOS)
@@ -612,9 +628,105 @@ def cruzar_con_base(normas, df):
                 'KEYWORDS_ENCONTRADAS': keywords_encontradas,
                 'KEYWORDS_DISTINTIVAS': distintivas_encontradas,
                 'TIPO': norma['TIPO'],
+                # Contexto para la capa de IA:
+                'ORGANISMO': str(row.get('ORGANISMO', '') or ''),
+                'NUMERO_NORMA': str(row.get('NUMERO_NORMA', '') or ''),
+                'TEXTO_NORMA': norma.get('TEXTO_ORIGINAL', norma['TEXTO']),
             })
 
     return alertas, normas_ignoradas
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MÓDULO 3-BIS: CONFIRMACIÓN CON IA (Gemini)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _consultar_gemini(prompt: str) -> str:
+    """Hace una consulta a la API de Gemini y devuelve el texto de la respuesta."""
+    url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 400},
+    }
+    r = requests.post(url, json=body, timeout=40)
+    r.raise_for_status()
+    data = r.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def confirmar_con_ia(id_caso, accion, desc_caso, texto_norma):
+    """Le pregunta a Gemini si la norma se refiere ESPECÍFICAMENTE al caso.
+    Devuelve (coincide, razon). coincide es True/False, o None si la IA falló."""
+    import json
+    prompt = f"""Sos analista de políticas públicas de la Fundación Libertad y Progreso. \
+Seguimos una lista de normas que proponemos desregular (modificar, derogar, eliminar o reglamentar).
+
+Te paso UN caso que seguimos y el TEXTO de una norma publicada hoy en el Boletín Oficial. \
+Decidí si la norma del Boletín se refiere ESPECÍFICAMENTE a la norma, el organismo o el tema del caso \
+(la modifica, deroga, reglamenta, crea o disuelve ese organismo, o cambia ese régimen). \
+Que solo compartan palabras sueltas o temas generales NO alcanza: tiene que ser sobre lo mismo.
+
+CASO {id_caso} (acción que proponemos: {accion}):
+{desc_caso}
+
+NORMA DEL BOLETÍN:
+{texto_norma[:IA_MAX_CHARS_NORMA]}
+
+Respondé SOLO con un JSON válido, sin texto adicional:
+{{"coincide": true, "razon": "<una frase breve>"}}  ó  {{"coincide": false, "razon": "<una frase breve>"}}"""
+    try:
+        txt = _consultar_gemini(prompt).strip()
+        m = re.search(r'\{.*\}', txt, re.DOTALL)
+        if not m:
+            # Respuesta sin JSON: incierto → None (se conserva para revisión manual).
+            return None, f"respuesta no interpretable: {txt[:120]}"
+        obj = json.loads(m.group(0))
+        # Solo descartamos ante un 'false' EXPLÍCITO; cualquier otra cosa = incierto.
+        if 'coincide' not in obj:
+            return None, f"sin campo coincide: {txt[:120]}"
+        return bool(obj.get('coincide')), str(obj.get('razon', ''))[:300]
+    except Exception as e:
+        return None, f"error: {e}"
+
+
+def confirmar_alertas_con_ia(alertas):
+    """Revisa cada candidata con la IA. Devuelve (confirmadas, descartadas).
+    Ante un error de IA, NO descarta la candidata (la conserva marcada para revisión
+    manual): preferimos un falso positivo a perder una coincidencia real."""
+    if not GEMINI_API_KEY:
+        msg = ("USAR_IA está activado pero falta GEMINI_API_KEY. Se envían las "
+               "coincidencias por keywords sin el filtro de IA. Cargá el secret "
+               "GEMINI_API_KEY o poné USAR_IA=false.")
+        print(f"  ⚠️  {msg}")
+        enviar_alerta_error("IA activada sin GEMINI_API_KEY", msg)
+        return alertas, []
+
+    confirmadas, descartadas, errores = [], [], 0
+    for a in alertas:
+        desc = (f"Organismo: {a.get('ORGANISMO', '')}. "
+                f"Norma objetivo: {a.get('NUMERO_NORMA', '')}. "
+                f"Términos del caso: {', '.join(a['KEYWORDS_ENCONTRADAS'])}.")
+        coincide, razon = confirmar_con_ia(a['ID'], a['ACCION'], desc, a.get('TEXTO_NORMA', ''))
+        a['IA_RAZON'] = razon
+        if coincide is None:
+            errores += 1
+            a['IA_RAZON'] = f"IA no disponible ({razon}); revisar manualmente"
+            confirmadas.append(a)
+        elif coincide:
+            confirmadas.append(a)
+        else:
+            descartadas.append(a)
+        print(f"  🤖 {a['ID']}: {'✅ confirma' if coincide else ('⚠️ sin respuesta' if coincide is None else '✖ descarta')}")
+        time.sleep(IA_DELAY_SEGUNDOS)
+
+    print(f"  🤖 IA: {len(confirmadas)} confirmadas, {len(descartadas)} descartadas, "
+          f"{errores} sin respuesta (de {len(alertas)} candidatas).")
+    if alertas and errores == len(alertas):
+        enviar_alerta_error(
+            "La IA no respondió en ninguna consulta",
+            "Ninguna consulta a Gemini tuvo éxito (revisá GEMINI_API_KEY, el modelo o la "
+            "cuota). Se enviaron las coincidencias por keywords sin filtrar.")
+    return confirmadas, descartadas
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -696,7 +808,7 @@ def construir_html_listado(normas):
     return html
 
 
-def construir_email_completo(alertas, normas_ignoradas, listado_html=""):
+def construir_email_completo(alertas, normas_ignoradas, listado_html="", descartadas_ia=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     cuerpo = f"""
@@ -732,6 +844,9 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html=""):
                 <p style="margin: 3px 0; font-size: 12px; color: #7f8c8d;">
                     Otras keywords: {', '.join(a['KEYWORDS_ENCONTRADAS'])}
                 </p>
+                <p style="margin: 3px 0; font-size: 13px; color: #16a085;">
+                    {('🤖 <b>IA:</b> ' + a['IA_RAZON']) if a.get('IA_RAZON') else ''}
+                </p>
                 <p style="margin: 3px 0; font-size: 13px;">
                     <b>Título:</b> {a['TITULO']}
                 </p>
@@ -747,6 +862,29 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html=""):
             ✅ Sin coincidencias con la base de datos hoy.
         </p>
         """
+
+    # Candidatas que la IA descartó (se muestran para poder auditar la IA).
+    if descartadas_ia:
+        cuerpo += f"""
+        <div style="background-color: #f8f9f9; border: 1px solid #d5dbdb;
+                    padding: 12px 15px; border-radius: 6px; margin: 15px 0;">
+            <h4 style="color: #7f8c8d; margin: 0 0 8px 0;">
+                🤖 {len(descartadas_ia)} candidata(s) revisada(s) y descartada(s) por la IA
+            </h4>
+            <p style="color: #95a5a6; font-size: 12px; margin-top: 0;">
+                Coincidieron por palabras clave pero la IA las consideró no relevantes.
+                Listadas por si querés verificar.
+            </p>
+        """
+        for d in descartadas_ia:
+            cuerpo += f"""
+            <div style="margin: 6px 0 6px 10px; font-size: 12px; color: #7f8c8d;">
+                <b>{d['ID']}</b> — {d['TITULO']}<br>
+                🤖 {d.get('IA_RAZON', '')}
+                — <a href='{d['URL']}' style="font-size: 11px;">ver norma</a>
+            </div>
+            """
+        cuerpo += "</div>"
 
     # Listado del boletín
     if listado_html:
@@ -821,7 +959,7 @@ def enviar_alerta_error(titulo_error: str, detalle: str):
         print(f"🚨 ALERTA (no se pudo enviar por email): {titulo_error} — {detalle}")
 
 
-def enviar_email(alertas, normas_ignoradas, listado_html=""):
+def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     if alertas:
@@ -831,7 +969,7 @@ def enviar_email(alertas, normas_ignoradas, listado_html=""):
     else:
         asunto = f"✅ RADAR: Sin novedades ({fecha_hoy})"
 
-    cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html)
+    cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html, descartadas_ia)
     enviar_html(asunto, cuerpo_html)
 
 
@@ -862,7 +1000,16 @@ def ejecutar_radar():
     print(f"\n🔎 Cruzando {len(df)} casos contra {len(normas)} normas...")
     alertas, normas_ignoradas = cruzar_con_base(normas, df)
 
-    print(f"\n📊 Resultado: {len(alertas)} coincidencias, {normas_ignoradas} de RRHH filtradas.")
+    print(f"\n📊 Coincidencias por keywords: {len(alertas)} | {normas_ignoradas} de RRHH filtradas.")
+
+    # --- FASE 4: confirmación con IA (Gemini) ---
+    # El filtro de keywords ya preseleccionó candidatas; la IA descarta las que
+    # solo comparten vocabulario. Apagada por defecto (USAR_IA).
+    descartadas_ia = []
+    if USAR_IA and alertas:
+        print(f"\n🤖 Confirmando {len(alertas)} candidata(s) con IA ({GEMINI_MODEL})...")
+        alertas, descartadas_ia = confirmar_alertas_con_ia(alertas)
+        print(f"📊 Tras IA: {len(alertas)} confirmadas, {len(descartadas_ia)} descartadas.")
 
     # Salvaguarda: un número anómalo de coincidencias sugiere una regresión.
     if len(alertas) > MAX_ALERTAS_RAZONABLE:
@@ -877,7 +1024,7 @@ def ejecutar_radar():
     if INCLUIR_LISTADO_BOLETIN:
         listado_html = construir_html_listado(normas)
 
-    enviar_email(alertas, normas_ignoradas, listado_html)
+    enviar_email(alertas, normas_ignoradas, listado_html, descartadas_ia)
 
 
 if __name__ == "__main__":
