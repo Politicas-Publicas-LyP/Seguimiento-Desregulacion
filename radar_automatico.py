@@ -18,6 +18,16 @@ PASSWORD_APP = os.environ.get('PASSWORD_APP')
 #   EMAIL_DESTINO="correo1@gmail.com,correo2@gmail.com"
 EMAIL_DESTINO = os.environ.get('EMAIL_DESTINO', '')
 
+# El envío usa SMTP. Por defecto apunta a Gmail, pero el servidor es configurable:
+# así podés usar CUALQUIER proveedor (Gmail, GMX, Zoho, etc.) sin tocar el código,
+# definiendo SMTP_HOST y SMTP_PORT como variables/secrets.
+#   - Gmail:  SMTP_HOST=smtp.gmail.com  (requiere contraseña de aplicación)
+#   - GMX:    SMTP_HOST=mail.gmx.com    (permite la contraseña normal de la cuenta)
+# EMAIL_ORIGEN = dirección remitente; PASSWORD_APP = la contraseña SMTP que pida
+# el proveedor (de aplicación en Gmail, o la normal en GMX).
+SMTP_HOST = os.environ.get('SMTP_HOST') or 'smtp.gmail.com'
+SMTP_PORT = int(os.environ.get('SMTP_PORT') or '587')
+
 # --- CONFIGURACIÓN GENERAL ---
 NOMBRE_ARCHIVO_BASE = 'seguimiento_desregulacion_estandarizado'
 NOMBRE_HOJA_EXCEL = 'Radar'
@@ -758,6 +768,33 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html=""):
 # MÓDULO 5: ENVÍO DE EMAIL (soporta múltiples destinatarios)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def enviar_html(asunto: str, cuerpo_html: str) -> bool:
+    """Envía un email HTML por SMTP de Gmail. Devuelve True si se envió.
+    Requiere EMAIL_ORIGEN (cuenta Gmail) y PASSWORD_APP (contraseña de aplicación)."""
+    destinatarios = parsear_destinatarios(EMAIL_DESTINO)
+    if not all([EMAIL_ORIGEN, PASSWORD_APP]) or not destinatarios:
+        print("❌ Faltan credenciales de email (EMAIL_ORIGEN/PASSWORD_APP) o destinatarios.")
+        return False
+
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_ORIGEN
+    msg['To'] = ', '.join(destinatarios)
+    msg['Subject'] = asunto
+    msg.attach(MIMEText(cuerpo_html, 'html'))
+
+    try:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_ORIGEN, PASSWORD_APP)
+        server.sendmail(EMAIL_ORIGEN, destinatarios, msg.as_string())
+        server.quit()
+        print(f"✅ Email enviado a: {', '.join(destinatarios)}")
+        return True
+    except Exception as e:
+        print(f"❌ Error al enviar email: {e}")
+        return False
+
+
 def enviar_alerta_error(titulo_error: str, detalle: str):
     """Envía un email de ALERTA cuando el radar no puede operar con normalidad.
 
@@ -766,12 +803,6 @@ def enviar_alerta_error(titulo_error: str, detalle: str):
     el problema. Si no hay credenciales, al menos queda registrado en el log.
     """
     fecha_hoy = date.today().strftime('%d/%m/%Y')
-    destinatarios = parsear_destinatarios(EMAIL_DESTINO)
-
-    if not all([EMAIL_ORIGEN, PASSWORD_APP]) or not destinatarios:
-        print(f"🚨 ALERTA (sin email configurado): {titulo_error} — {detalle}")
-        return
-
     cuerpo_html = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <div style="background-color: #fdf2f2; border: 2px solid #c0392b;
@@ -786,30 +817,11 @@ def enviar_alerta_error(titulo_error: str, detalle: str):
         </div>
     </div>
     """
-
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_ORIGEN
-    msg['To'] = ', '.join(destinatarios)
-    msg['Subject'] = f"🚨 RADAR: ERROR — {titulo_error} ({fecha_hoy})"
-    msg.attach(MIMEText(cuerpo_html, 'html'))
-
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(EMAIL_ORIGEN, PASSWORD_APP)
-        server.sendmail(EMAIL_ORIGEN, destinatarios, msg.as_string())
-        server.quit()
-        print(f"🚨 Alerta de error enviada a: {', '.join(destinatarios)}")
-    except Exception as e:
-        print(f"❌ No se pudo enviar la alerta de error: {e}")
+    if not enviar_html(f"🚨 RADAR: ERROR — {titulo_error} ({fecha_hoy})", cuerpo_html):
+        print(f"🚨 ALERTA (no se pudo enviar por email): {titulo_error} — {detalle}")
 
 
 def enviar_email(alertas, normas_ignoradas, listado_html=""):
-    destinatarios = parsear_destinatarios(EMAIL_DESTINO)
-    if not all([EMAIL_ORIGEN, PASSWORD_APP]) or not destinatarios:
-        print("❌ Faltan credenciales de email o destinatarios.")
-        return
-
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     if alertas:
@@ -820,21 +832,7 @@ def enviar_email(alertas, normas_ignoradas, listado_html=""):
         asunto = f"✅ RADAR: Sin novedades ({fecha_hoy})"
 
     cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html)
-
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_ORIGEN
-    msg['To'] = ', '.join(destinatarios)
-    msg['Subject'] = asunto
-    msg.attach(MIMEText(cuerpo_html, 'html'))
-
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(EMAIL_ORIGEN, PASSWORD_APP)
-        server.sendmail(EMAIL_ORIGEN, destinatarios, msg.as_string())
-        print(f"✅ Email enviado a: {', '.join(destinatarios)}")
-    except Exception as e:
-        print(f"❌ Error al enviar email: {e}")
+    enviar_html(asunto, cuerpo_html)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
