@@ -480,16 +480,23 @@ def cargar_archivo_robusto():
 
 def escanear_boletin():
     fecha_hoy = date.today().strftime('%d/%m/%Y')
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    # User-Agent realista + headers de navegador: reduce timeouts y bloqueos del BORA.
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-AR,es;q=0.9',
+    }
     normas = []
     urls_vistas = set()
 
     print(f"📡 Escaneando Primera Sección del BORA ({fecha_hoy})...")
-    r = get_con_reintentos(URL_PRIMERA_SECCION, headers, timeout=20)
+    # Más tiempo y más reintentos: el timeout suele ser transitorio desde GitHub.
+    r = get_con_reintentos(URL_PRIMERA_SECCION, headers, timeout=30, intentos=4, espera=8)
 
     if r is None or r.status_code != 200:
         print("  ⚠️  No se pudo acceder a la Primera Sección del BORA.")
-        return normas
+        return normas, False   # leido_ok=False: no se pudo leer el BORA
 
     soup = BeautifulSoup(r.text, 'html.parser')
 
@@ -545,7 +552,7 @@ def escanear_boletin():
             print(f"  ⚠️  {msg}")
             enviar_alerta_error("Lectura de texto completo degradada", msg)
 
-    return normas
+    return normas, True   # leido_ok=True: el índice del BORA se leyó correctamente
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -858,8 +865,11 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
         cuerpo += "</div>"
     else:
         cuerpo += """
-        <p style="color: #27ae60; font-weight: bold;">
-            ✅ Sin coincidencias con la base de datos hoy.
+        <p style="color: #27ae60; font-weight: bold; margin-bottom: 4px;">
+            ✅ El Boletín de hoy se leyó con éxito, pero no hubo coincidencias con la base.
+        </p>
+        <p style="color: #7f8c8d; font-size: 13px; margin-top: 0;">
+            Igual se sugiere una revisión manual del listado de abajo por las dudas.
         </p>
         """
 
@@ -959,6 +969,29 @@ def enviar_alerta_error(titulo_error: str, detalle: str):
         print(f"🚨 ALERTA (no se pudo enviar por email): {titulo_error} — {detalle}")
 
 
+def enviar_aviso(titulo: str, detalle: str):
+    """Envía un email INFORMATIVO (no de error) cuando el radar corrió pero no pudo
+    llegar a un resultado concluyente hoy (BORA inaccesible, día sin novedades, etc.).
+    No es una falla del sistema: solo avisa que conviene una revisión manual."""
+    fecha_hoy = date.today().strftime('%d/%m/%Y')
+    cuerpo_html = f"""
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 700px; margin: 0 auto;">
+        <div style="background-color: #eef5fb; border: 1px solid #2980b9;
+                    padding: 18px; border-radius: 6px;">
+            <h2 style="color: #2471a3; margin-top: 0;">ℹ️ Radar Desregulación — {fecha_hoy}</h2>
+            <p style="font-size: 14px;"><b>{titulo}</b></p>
+            <p style="font-size: 13px; color: #2c3e50;">{detalle}</p>
+            <p style="font-size: 13px; color: #2c3e50; margin-top: 12px;">
+                👉 Se recomienda una <b>revisión manual</b> del Boletín de hoy:
+                <a href="{URL_PRIMERA_SECCION}">ver Primera Sección en el BORA</a>.
+            </p>
+        </div>
+    </div>
+    """
+    if not enviar_html(f"ℹ️ RADAR: revisión manual sugerida ({fecha_hoy})", cuerpo_html):
+        print(f"ℹ️ AVISO (no se pudo enviar por email): {titulo} — {detalle}")
+
+
 def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
@@ -983,19 +1016,29 @@ def ejecutar_radar():
     print("=" * 60)
 
     df = cargar_archivo_robusto()
-    normas = escanear_boletin()
+    normas, leido_ok = escanear_boletin()
 
-    # Fallar ruidoso: si el BORA no devolvió normas (o devolvió muy pocas),
-    # probablemente hubo un bloqueo o un cambio de HTML. Avisar en vez de
-    # enviar un "sin novedades" engañoso.
+    # Caso 1: no se pudo ni acceder al BORA (timeout / sitio caído). NO es una falla
+    # del sistema: se manda un aviso informativo y se termina limpio (sin error rojo).
+    if not leido_ok:
+        enviar_aviso(
+            "No se pudo acceder al Boletín Oficial hoy",
+            "El radar intentó leer la Primera Sección del BORA pero no obtuvo respuesta "
+            "(timeout o sitio caído). Suele ser un problema transitorio de red. No se "
+            "pudo verificar el boletín de hoy.")
+        print("ℹ️ BORA inaccesible: se envió aviso de revisión manual.")
+        return
+
+    # Caso 2: se accedió pero con muy pocas normas (día no hábil / sin edición, o un
+    # posible cambio en el sitio). Aviso informativo, sin cortar con error.
     if len(normas) < MINIMO_NORMAS_ESPERADAS:
-        msg = (f"El escaneo del BORA devolvió solo {len(normas)} norma(s), por debajo "
-               f"del mínimo esperado ({MINIMO_NORMAS_ESPERADAS}). Posibles causas: "
-               f"bloqueo de IP, BORA caído, día sin edición, o cambio en la estructura "
-               f"del sitio. El radar se detiene para no reportar un día como vacío por error.")
-        print(f"❌ {msg}")
-        enviar_alerta_error("Escaneo del BORA incompleto o vacío", msg)
-        sys.exit(1)
+        enviar_aviso(
+            "El Boletín de hoy trae muy pocas o ninguna norma",
+            f"Se accedió al BORA correctamente, pero solo se encontraron {len(normas)} "
+            f"norma(s) en la Primera Sección. Puede ser un día no hábil o sin edición. "
+            f"Si esperabas que hubiera boletín, podría indicar un cambio en el sitio.")
+        print(f"ℹ️ Solo {len(normas)} norma(s): se envió aviso de revisión manual.")
+        return
 
     print(f"\n🔎 Cruzando {len(df)} casos contra {len(normas)} normas...")
     alertas, normas_ignoradas = cruzar_con_base(normas, df)
