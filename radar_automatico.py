@@ -649,16 +649,38 @@ def cruzar_con_base(normas, df):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _consultar_gemini(prompt: str) -> str:
-    """Hace una consulta a la API de Gemini y devuelve el texto de la respuesta."""
+    """Hace una consulta a la API de Gemini y devuelve el texto de la respuesta.
+    Lanza una excepción con el motivo concreto si algo falla (para diagnóstico)."""
     url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 400},
-    }
-    r = requests.post(url, json=body, timeout=40)
-    r.raise_for_status()
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    generation_config = {"temperature": 0, "maxOutputTokens": 600}
+    # Los modelos 2.5/3 "piensan" por defecto y se comen el presupuesto de tokens
+    # dejando la respuesta vacía. Desactivamos ese pensamiento para esta tarea simple.
+    if any(s in GEMINI_MODEL for s in ("2.5", "3.")) or "flash-lite" in GEMINI_MODEL:
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
+
+    ultimo_error = None
+    for intento in range(1, 3):  # 1 reintento ante fallos transitorios (DNS/red)
+        try:
+            r = requests.post(url, json=body, timeout=40)
+            if r.status_code != 200:
+                # Surface el mensaje real de la API (key inválida, modelo inexistente, cuota…)
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            cands = data.get("candidates") or []
+            if not cands:
+                raise RuntimeError(f"sin candidates: {str(data)[:200]}")
+            parts = (cands[0].get("content") or {}).get("parts") or []
+            textos = [p.get("text", "") for p in parts if p.get("text")]
+            if not textos:
+                raise RuntimeError(f"respuesta sin texto (finishReason="
+                                   f"{cands[0].get('finishReason', '?')})")
+            return " ".join(textos)
+        except Exception as e:
+            ultimo_error = e
+            if intento < 2:
+                time.sleep(3)
+    raise ultimo_error
 
 
 def confirmar_con_ia(id_caso, accion, desc_caso, texto_norma):
@@ -723,7 +745,10 @@ def confirmar_alertas_con_ia(alertas):
             confirmadas.append(a)
         else:
             descartadas.append(a)
-        print(f"  🤖 {a['ID']}: {'✅ confirma' if coincide else ('⚠️ sin respuesta' if coincide is None else '✖ descarta')}")
+        if coincide is None:
+            print(f"  🤖 {a['ID']}: ⚠️ sin respuesta — {razon}")
+        else:
+            print(f"  🤖 {a['ID']}: {'✅ confirma' if coincide else '✖ descarta'} — {razon}")
         time.sleep(IA_DELAY_SEGUNDOS)
 
     print(f"  🤖 IA: {len(confirmadas)} confirmadas, {len(descartadas)} descartadas, "
