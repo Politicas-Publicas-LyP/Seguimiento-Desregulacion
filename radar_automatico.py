@@ -688,12 +688,20 @@ def confirmar_con_ia(id_caso, accion, desc_caso, texto_norma):
     Devuelve (coincide, razon). coincide es True/False, o None si la IA falló."""
     import json
     prompt = f"""Sos analista de políticas públicas de la Fundación Libertad y Progreso. \
-Seguimos una lista de normas que proponemos desregular (modificar, derogar, eliminar o reglamentar).
+Seguimos una lista de normas y organismos que proponemos desregular (modificar, derogar, eliminar, crear o reglamentar).
 
 Te paso UN caso que seguimos y el TEXTO de una norma publicada hoy en el Boletín Oficial. \
-Decidí si la norma del Boletín se refiere ESPECÍFICAMENTE a la norma, el organismo o el tema del caso \
-(la modifica, deroga, reglamenta, crea o disuelve ese organismo, o cambia ese régimen). \
-Que solo compartan palabras sueltas o temas generales NO alcanza: tiene que ser sobre lo mismo.
+Tu tarea es decidir si esta norma del Boletín TIENE POR OBJETO actuar sobre lo del caso.
+
+- Respondé "coincide": true SOLO si el objeto de la norma es modificar, derogar, sustituir, crear, \
+disolver o reglamentar la norma, el organismo o el régimen del caso (o cambiar directamente sus reglas).
+- Respondé "coincide": false si la norma solo MENCIONA, CITA, INVOCA, APLICA o USA esa norma u organismo \
+como parte de otro trámite: por ejemplo, lo cita como fundamento legal, le pide un dictamen o una tasación, \
+nombra al organismo como autor de un acto de rutina, o apenas comparte vocabulario o temática. \
+Mencionar o usar NO es lo mismo que reformar.
+
+Ejemplo: si el caso busca ELIMINAR el "Tribunal de Tasaciones de la Nación", una norma que simplemente \
+le solicita al Tribunal un dictamen de valor para administrar un bien es coincide:false (lo usa, no lo reforma).
 
 CASO {id_caso} (acción que proponemos: {accion}):
 {desc_caso}
@@ -702,7 +710,7 @@ NORMA DEL BOLETÍN:
 {texto_norma[:IA_MAX_CHARS_NORMA]}
 
 Respondé SOLO con un JSON válido, sin texto adicional:
-{{"coincide": true, "razon": "<una frase breve>"}}  ó  {{"coincide": false, "razon": "<una frase breve>"}}"""
+{{"coincide": true, "razon": "<frase breve indicando QUÉ norma/artículo/organismo modifica>"}}  ó  {{"coincide": false, "razon": "<frase breve, p. ej. 'solo lo menciona/usa, no lo reforma'>"}}"""
     try:
         txt = _consultar_gemini(prompt).strip()
         m = re.search(r'\{.*\}', txt, re.DOTALL)
