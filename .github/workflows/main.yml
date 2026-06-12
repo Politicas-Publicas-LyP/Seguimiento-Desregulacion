@@ -1,12 +1,24 @@
 name: Ejecutar Radar Desregulación Diario
 
+# El cron de GitHub es "best effort": puede demorarse. Por eso programamos VARIOS
+# horarios a la mañana (lun-vie). El primero que GitHub honre envía el mail; los
+# demás se omiten gracias al control de "ya se envió hoy" (archivo .ultimo_envio).
+# Así el mail llega a la mañana aunque algún horario se atrase, sin duplicados.
 on:
   schedule:
-    # Se ejecuta a las 10:17 UTC (07:17 AM Argentina), de lunes a viernes.
-    # Se usa un minuto "raro" (no las :00 en punto) a propósito: el cron de GitHub
-    # se congestiona y se saltea/demora en las horas redondas. 10:17 es más confiable.
-    - cron: '17 10 * * 1-5'
-  workflow_dispatch:
+    - cron: '15 10 * * 1-5'   # 07:15 ARG
+    - cron: '10 11 * * 1-5'   # 08:10 ARG
+    - cron: '5 12 * * 1-5'    # 09:05 ARG
+    - cron: '0 13 * * 1-5'    # 10:00 ARG
+  workflow_dispatch:           # ejecución manual (siempre corre, sin importar el control)
+
+# Que no se solapen dos corridas (los horarios están separados, pero por las dudas).
+concurrency:
+  group: radar-diario
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # necesario para commitear la marca .ultimo_envio
 
 jobs:
   escanear-bora:
@@ -16,17 +28,31 @@ jobs:
       - name: Descargar el repositorio
         uses: actions/checkout@v4
 
+      - name: ¿Ya se envió hoy?
+        id: chequeo
+        run: |
+          HOY=$(TZ='America/Argentina/Buenos_Aires' date +%F)
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -f .ultimo_envio ] && [ "$(cat .ultimo_envio)" = "$HOY" ]; then
+            echo "correr=no" >> "$GITHUB_OUTPUT"
+            echo "✅ Ya se envió hoy ($HOY). Se omite esta corrida programada."
+          else
+            echo "correr=si" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Configurar Python
+        if: steps.chequeo.outputs.correr == 'si'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Instalar dependencias
+        if: steps.chequeo.outputs.correr == 'si'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Ejecutar el Radar
+        if: steps.chequeo.outputs.correr == 'si'
         env:
           EMAIL_ORIGEN: ${{ secrets.EMAIL_ORIGEN }}
           PASSWORD_APP: ${{ secrets.PASSWORD_APP }}
@@ -45,8 +71,19 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           # --- Capa de IA (Gemini) ---
           # Activar poniendo la variable USAR_IA = true y cargando el secret GEMINI_API_KEY.
-          # GEMINI_MODEL es opcional (por defecto gemini-2.5-flash).
+          # GEMINI_MODEL es opcional (por defecto gemini-2.5-flash-lite).
           USAR_IA: ${{ vars.USAR_IA }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
         run: python radar_automatico.py
+
+      - name: Marcar que ya se envió hoy
+        # Solo si el Radar corrió y terminó OK (no en errores de configuración).
+        if: steps.chequeo.outputs.correr == 'si' && success()
+        run: |
+          TZ='America/Argentina/Buenos_Aires' date +%F > .ultimo_envio
+          git config user.name  "radar-bot"
+          git config user.email "actions@github.com"
+          git add .ultimo_envio
+          git commit -m "chore: marca de envío diario [skip ci]" || echo "Sin cambios que commitear."
+          git push || echo "No se pudo pushear la marca."
