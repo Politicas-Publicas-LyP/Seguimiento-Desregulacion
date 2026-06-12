@@ -7,6 +7,9 @@ name: Ejecutar Radar Desregulación Diario
 on:
   schedule:
     - cron: '15 10 * * 1-5'   # 07:15 ARG
+    - cron: '25 10 * * 1-5'   # 07:25 ARG
+    - cron: '35 10 * * 1-5'   # 07:35 ARG
+    - cron: '45 10 * * 1-5'   # 07:45 ARG
     - cron: '10 11 * * 1-5'   # 08:10 ARG
     - cron: '5 12 * * 1-5'    # 09:05 ARG
     - cron: '0 13 * * 1-5'    # 10:00 ARG
