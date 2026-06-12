@@ -35,11 +35,13 @@ SMTP_PORT = int(os.environ.get('SMTP_PORT') or '587')
 # no es "true", el radar funciona igual que ahora (solo keywords).
 USAR_IA = (os.environ.get('USAR_IA', 'false').lower() == 'true')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-# Modelo configurable. Por defecto el mejor equilibrio dentro del tier gratuito.
-# Alternativas: "gemini-3.5-flash" (más nuevo), "gemini-2.5-flash-lite" (más liviano).
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-flash'
+# Modelo configurable. Por defecto flash-lite: tiene MÁS cupo gratuito (más
+# pedidos por minuto y por día) y sufre menos saturación (HTTP 503) que el flash
+# completo, lo que lo hace más confiable para una corrida diaria desatendida.
+# Si querés más matiz de razonamiento: GEMINI_MODEL=gemini-2.5-flash.
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-flash-lite'
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-IA_DELAY_SEGUNDOS = 1.5      # pausa entre consultas para respetar el límite gratuito
+IA_DELAY_SEGUNDOS = 4.0      # pausa entre consultas para respetar el límite por minuto del tier gratuito
 IA_MAX_CHARS_NORMA = 8000    # recorte del texto de la norma que se manda a la IA
 
 # --- CONFIGURACIÓN GENERAL ---
@@ -653,33 +655,47 @@ def _consultar_gemini(prompt: str) -> str:
     Lanza una excepción con el motivo concreto si algo falla (para diagnóstico)."""
     url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     generation_config = {"temperature": 0, "maxOutputTokens": 600}
-    # Los modelos 2.5/3 "piensan" por defecto y se comen el presupuesto de tokens
-    # dejando la respuesta vacía. Desactivamos ese pensamiento para esta tarea simple.
-    if any(s in GEMINI_MODEL for s in ("2.5", "3.")) or "flash-lite" in GEMINI_MODEL:
+    # Los modelos flash "completos" 2.5/3 "piensan" por defecto y se comen el
+    # presupuesto de tokens dejando la respuesta vacía. Desactivamos ese pensamiento.
+    # flash-lite ya viene sin pensamiento, así que NO le mandamos el parámetro
+    # (evita un posible rechazo del campo).
+    if ("2.5" in GEMINI_MODEL or "3." in GEMINI_MODEL) and "lite" not in GEMINI_MODEL:
         generation_config["thinkingConfig"] = {"thinkingBudget": 0}
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
 
+    # Errores de configuración (no tiene sentido reintentar): key/modelo/permiso.
+    NO_REINTENTAR = (400, 401, 403, 404)
+    # Esperas crecientes ante fallos transitorios: 503 (saturado), 429 (cupo por
+    # minuto), 5xx o errores de red. Primer intento sin espera.
+    esperas = [0, 5, 12, 25]
     ultimo_error = None
-    for intento in range(1, 3):  # 1 reintento ante fallos transitorios (DNS/red)
+    for espera in esperas:
+        if espera:
+            time.sleep(espera)
         try:
             r = requests.post(url, json=body, timeout=40)
-            if r.status_code != 200:
-                # Surface el mensaje real de la API (key inválida, modelo inexistente, cuota…)
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-            data = r.json()
-            cands = data.get("candidates") or []
-            if not cands:
-                raise RuntimeError(f"sin candidates: {str(data)[:200]}")
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            textos = [p.get("text", "") for p in parts if p.get("text")]
-            if not textos:
-                raise RuntimeError(f"respuesta sin texto (finishReason="
-                                   f"{cands[0].get('finishReason', '?')})")
-            return " ".join(textos)
-        except Exception as e:
-            ultimo_error = e
-            if intento < 2:
-                time.sleep(3)
+        except requests.exceptions.RequestException as e:
+            ultimo_error = RuntimeError(f"red: {e}")
+            continue
+        if r.status_code in NO_REINTENTAR:
+            # Surface el mensaje real (key inválida, modelo inexistente…) y cortar ya.
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code != 200:
+            # 429 / 503 / 5xx: transitorio → reintentar con más espera.
+            ultimo_error = RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+            continue
+        data = r.json()
+        cands = data.get("candidates") or []
+        if not cands:
+            ultimo_error = RuntimeError(f"sin candidates: {str(data)[:160]}")
+            continue
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        textos = [p.get("text", "") for p in parts if p.get("text")]
+        if not textos:
+            ultimo_error = RuntimeError(
+                f"respuesta sin texto (finishReason={cands[0].get('finishReason', '?')})")
+            continue
+        return " ".join(textos)
     raise ultimo_error
 
 
