@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from datetime import date
+from datetime import date, datetime, timedelta
 import os
 import smtplib
 from email.mime.text import MIMEText
@@ -66,6 +66,20 @@ URL_BORA_BASE = "https://www.boletinoficial.gob.ar"
 
 # Solo escaneamos la Primera Sección (Decretos, Resoluciones, Leyes, etc.)
 URL_PRIMERA_SECCION = f"{URL_BORA_BASE}/seccion/primera"
+
+# ─── FUENTE PRIMARIA DE NORMAS DEL DÍA ───────────────────────────────────────
+# "vigia" → usa la API de Vigía (vigia-api.openarg.org) como fuente primaria del
+#           listado de normas del día (más confiable y con metadata). Si Vigía
+#           falla o está desactualizada, cae automáticamente al scraping del BORA.
+# "bora"  → usa directamente el scraping del BORA (comportamiento histórico).
+# En AMBOS casos el matching corre sobre el TEXTO COMPLETO bajado de la ficha del
+# BORA (diseño híbrido): Vigía aporta la LISTA del día, no reemplaza el texto.
+FUENTE_PRIMARIA = (os.environ.get('FUENTE_PRIMARIA') or 'vigia').lower()
+VIGIA_API_BASE = (os.environ.get('VIGIA_API_BASE') or 'https://vigia-api.openarg.org').rstrip('/')
+# Token opcional (los endpoints de datos de Vigía son públicos; no hace falta hoy).
+VIGIA_API_TOKEN = os.environ.get('VIGIA_API_TOKEN', '')
+VIGIA_TIMEOUT = 25           # timeout por request a Vigía
+VIGIA_MAX_PAGINAS = 8        # tope de páginas (x100) al traer las normas del día
 
 # Incluir listado completo de normas del día en el email (sin IA, solo títulos y links)
 INCLUIR_LISTADO_BOLETIN = True
@@ -480,81 +494,187 @@ def cargar_archivo_robusto():
 # MÓDULO 2: ESCANEO DEL BORA (solo Primera Sección)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def escanear_boletin():
-    fecha_hoy = date.today().strftime('%d/%m/%Y')
-    # User-Agent realista + headers de navegador: reduce timeouts y bloqueos del BORA.
-    headers = {
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                       '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'es-AR,es;q=0.9',
+HEADERS_NAVEGADOR = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'es-AR,es;q=0.9',
+}
+
+# Mapa del 'tipo' de Vigía al TIPO del Radar. "OTRA" (avisos/edictos) → "Aviso",
+# que el matching ya omite (igual que se omiten los avisos del BORA).
+TIPO_VIGIA_A_RADAR = {
+    "DNU": "Decreto de Necesidad y Urgencia",
+    "DECRETO": "Decreto",
+    "LEY": "Ley",
+    "RESOLUCION": "Resolución",
+    "DISPOSICION": "Disposición",
+    "COMUNICACION": "Comunicación",
+    "PROYECTO": "Otros",
+    "OTRA": "Aviso",
+}
+
+
+def _vigia_get_json(path, params=None):
+    """GET a la API de Vigía. Devuelve el JSON; lanza excepción si falla."""
+    h = {'Accept': 'application/json', 'User-Agent': HEADERS_NAVEGADOR['User-Agent']}
+    if VIGIA_API_TOKEN:
+        h['Authorization'] = f"Bearer {VIGIA_API_TOKEN}"
+    r = requests.get(f"{VIGIA_API_BASE}{path}", headers=h, params=params, timeout=VIGIA_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+    return r.json()
+
+
+def _vigia_bora_fresco(hoy_iso):
+    """True si la fuente bora_primera de Vigía está OK y actualizada al día de hoy."""
+    data = _vigia_get_json("/health/sources")
+    for s in data.get("sources", []):
+        if s.get("code") == "bora_primera":
+            ok = (s.get("last_status") == "ok" and not s.get("stale")
+                  and s.get("max_fecha_publicacion") == hoy_iso)
+            print(f"  🛰️  Vigía bora_primera: status={s.get('last_status')}, "
+                  f"max_fecha={s.get('max_fecha_publicacion')}, stale={s.get('stale')} → "
+                  f"{'FRESCO' if ok else 'no fresco'}")
+            return ok
+    print("  ⚠️  Vigía: no apareció la fuente 'bora_primera' en /health/sources.")
+    return False
+
+
+def _norma_desde_vigia(it):
+    """Normaliza un item de Vigía al registro interno de norma."""
+    organismo = it.get("organismo") or it.get("emisor") or ""
+    numero = it.get("numero") or ""
+    titulo = it.get("titulo") or ""
+    texto_titulo = f"{organismo} {numero} {titulo}".strip()
+    titulo_norm = normalizar_texto(texto_titulo)
+    return {
+        'TEXTO': texto_titulo[:200],
+        'TEXTO_NORM': titulo_norm,
+        'TEXTO_MATCH': titulo_norm,
+        'TEXTO_ORIGINAL': texto_titulo,
+        'URL': it.get("url"),
+        'TIPO': TIPO_VIGIA_A_RADAR.get((it.get("tipo") or "").upper(), "Otros"),
+        'ES_RRHH': es_norma_de_rrhh(titulo_norm),
+        'VIGIA_RESUMEN': it.get("resumen") or "",
+        'VIGIA_RESUMEN_IA': it.get("resumen_ia") or "",
     }
-    normas = []
-    urls_vistas = set()
 
-    print(f"📡 Escaneando Primera Sección del BORA ({fecha_hoy})...")
-    # Más tiempo y más reintentos: el timeout suele ser transitorio desde GitHub.
-    r = get_con_reintentos(URL_PRIMERA_SECCION, headers, timeout=30, intentos=4, espera=8)
 
+def obtener_lista_vigia(hoy_iso):
+    """Lista de normas de HOY (Primera Sección) desde la API de Vigía.
+    Devuelve (normas, ok). ok=False si Vigía no está fresca o falla → fallback."""
+    try:
+        if not _vigia_bora_fresco(hoy_iso):
+            return [], False
+        normas, vistas = [], set()
+        for pagina in range(VIGIA_MAX_PAGINAS):
+            data = _vigia_get_json("/normas", params={"limit": 100, "offset": pagina * 100})
+            page = data.get("items", [])
+            if not page:
+                break
+            hay_de_hoy = False
+            for it in page:
+                if it.get("fecha_publicacion") == hoy_iso:
+                    hay_de_hoy = True
+                    if (it.get("bora_seccion") == "Primera Sección"
+                            and it.get("url") and it["url"] not in vistas):
+                        vistas.add(it["url"])
+                        normas.append(_norma_desde_vigia(it))
+            if not hay_de_hoy:
+                break   # ya pasamos el bloque de normas de hoy
+        print(f"  🛰️  Vigía: {len(normas)} normas de hoy (Primera Sección).")
+        return normas, True
+    except Exception as e:
+        print(f"  ⚠️  Vigía no disponible: {e}")
+        return [], False
+
+
+def obtener_lista_bora():
+    """Lista de normas del día desde el scraping del índice del BORA (fallback).
+    Devuelve (normas, ok)."""
+    r = get_con_reintentos(URL_PRIMERA_SECCION, HEADERS_NAVEGADOR, timeout=30, intentos=4, espera=8)
     if r is None or r.status_code != 200:
         print("  ⚠️  No se pudo acceder a la Primera Sección del BORA.")
-        return normas, False   # leido_ok=False: no se pudo leer el BORA
-
+        return [], False
     soup = BeautifulSoup(r.text, 'html.parser')
-
+    normas, vistas = [], set()
     for link in soup.find_all('a', href=True):
         href = link['href']
         texto = link.get_text(" ", strip=True).upper()
         if 'detalleAviso' in href and len(texto) > 10:
             full_url = URL_BORA_BASE + href if href.startswith('/') else href
-            if full_url not in urls_vistas:
-                urls_vistas.add(full_url)
-                titulo_norm = normalizar_texto(texto)
-                normas.append({
-                    'TEXTO': texto,
-                    'TEXTO_NORM': titulo_norm,
-                    'TEXTO_MATCH': titulo_norm,   # por defecto = título; se enriquece abajo
-                    'TEXTO_ORIGINAL': texto,      # texto sin normalizar, para la IA
-                    'URL': full_url,
-                    'TIPO': clasificar_tipo_norma(titulo_norm),
-                    'ES_RRHH': es_norma_de_rrhh(titulo_norm),
-                })
+            if full_url in vistas:
+                continue
+            vistas.add(full_url)
+            tn = normalizar_texto(texto)
+            normas.append({
+                'TEXTO': texto, 'TEXTO_NORM': tn, 'TEXTO_MATCH': tn,
+                'TEXTO_ORIGINAL': texto, 'URL': full_url,
+                'TIPO': clasificar_tipo_norma(tn), 'ES_RRHH': es_norma_de_rrhh(tn),
+                'VIGIA_RESUMEN': '', 'VIGIA_RESUMEN_IA': '',
+            })
+    return normas, True
 
-    print(f"  ✅ {len(normas)} normas encontradas en la Primera Sección.")
 
-    # --- FASE 2: leer el texto completo de cada norma sustantiva ---
+def escanear_boletin():
+    """Obtiene las normas del día (Vigía primaria, BORA fallback) y baja el texto
+    completo de cada una. Devuelve (normas, leido_ok, fuente_usada)."""
+    fecha_hoy = date.today().strftime('%d/%m/%Y')
+    hoy_iso = (datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d')  # fecha Argentina
+
+    # --- Elegir fuente del listado ---
+    if FUENTE_PRIMARIA == 'vigia':
+        print(f"📡 Fuente primaria: Vigía — normas de hoy ({hoy_iso})...")
+        normas, ok = obtener_lista_vigia(hoy_iso)
+        if ok:
+            fuente_usada = 'vigia'
+        else:
+            print("  ↩️  Vigía no disponible/atrasada → fallback al scraping del BORA.")
+            normas, ok = obtener_lista_bora()
+            fuente_usada = 'bora_fallback'
+    else:
+        print(f"📡 Fuente primaria: BORA (scraping) — {fecha_hoy}...")
+        normas, ok = obtener_lista_bora()
+        fuente_usada = 'bora'
+
+    if not ok:
+        return [], False, fuente_usada
+
+    print(f"  ✅ {len(normas)} normas en la Primera Sección (fuente: {fuente_usada}).")
+
+    # --- Leer el texto completo de cada norma sustantiva (igual para ambas fuentes) ---
     if LEER_TEXTO_COMPLETO:
-        sustantivas = [n for n in normas if not n['ES_RRHH']]
+        sustantivas = [n for n in normas
+                       if not n['ES_RRHH'] and n['TIPO'] not in TIPOS_NO_MATCHEABLES]
         print(f"  📖 Leyendo el texto completo de {len(sustantivas)} normas "
               f"sustantivas (pausa de {BORA_DELAY_SEGUNDOS}s entre cada una)...")
         fallos = 0
         for i, norma in enumerate(sustantivas, 1):
-            resumen, cuerpo = obtener_texto_norma(norma['URL'], headers)
-            lectura_ok = len(cuerpo) >= MIN_CARACTERES_CUERPO
-            if not lectura_ok:
+            resumen, cuerpo = obtener_texto_norma(norma['URL'], HEADERS_NAVEGADOR)
+            if len(cuerpo) < MIN_CARACTERES_CUERPO:
                 fallos += 1
-            # El texto a matchear combina título + resumen oficial + cuerpo.
-            # Aunque falle el cuerpo, el resumen ya mejora respecto al título solo.
-            combinado = f"{norma['TEXTO']} {resumen} {cuerpo}"
+            # Texto a matchear = título + (resumen/resumen IA de Vigía, si hay) + cuerpo
+            # del BORA. Los resúmenes de Vigía cubren el caso en que falle la lectura.
+            combinado = (f"{norma['TEXTO']} {norma.get('VIGIA_RESUMEN', '')} "
+                         f"{norma.get('VIGIA_RESUMEN_IA', '')} {resumen} {cuerpo}")
             norma['TEXTO_MATCH'] = normalizar_texto(combinado)
-            norma['TEXTO_ORIGINAL'] = combinado   # sin normalizar, para la IA
+            norma['TEXTO_ORIGINAL'] = combinado
             if i % 15 == 0:
                 print(f"     ... {i}/{len(sustantivas)} leídas ({fallos} fallidas)")
             time.sleep(BORA_DELAY_SEGUNDOS)
 
         total = max(1, len(sustantivas))
         frac_fallos = fallos / total
-        print(f"  ✅ Texto completo leído. Fallos de lectura: {fallos}/{total} "
-              f"({frac_fallos:.0%}).")
+        print(f"  ✅ Texto completo leído. Fallos de lectura: {fallos}/{total} ({frac_fallos:.0%}).")
         if frac_fallos > MAX_FRACCION_FALLOS_LECTURA:
             msg = (f"No se pudo leer el cuerpo de {fallos} de {total} normas "
-                   f"({frac_fallos:.0%}). Posible bloqueo del BORA o cambio en el HTML "
-                   f"de las fichas. Las coincidencias de hoy pueden ser incompletas: "
-                   f"conviene revisar manualmente.")
+                   f"({frac_fallos:.0%}). Posible bloqueo del BORA o cambio de HTML. "
+                   f"Las coincidencias de hoy pueden ser incompletas: revisar manualmente.")
             print(f"  ⚠️  {msg}")
             enviar_alerta_error("Lectura de texto completo degradada", msg)
 
-    return normas, True   # leido_ok=True: el índice del BORA se leyó correctamente
+    return normas, True, fuente_usada
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -864,13 +984,25 @@ def construir_html_listado(normas):
     return html
 
 
-def construir_email_completo(alertas, normas_ignoradas, listado_html="", descartadas_ia=None):
+def construir_email_completo(alertas, normas_ignoradas, listado_html="", descartadas_ia=None,
+                             fuente_usada=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
+
+    # Nota de fuente: si se usó el fallback (Vigía no disponible), avisarlo arriba.
+    nota_fuente = ""
+    if fuente_usada == 'bora_fallback':
+        nota_fuente = ("""
+        <p style="background:#fef9e7; border:1px solid #f39c12; border-radius:4px;
+                  padding:8px 12px; font-size:12px; color:#7d6608; margin:0 0 10px 0;">
+            ⚠️ Vigía no estaba disponible o actualizada hoy: se usó el scraping directo del
+            BORA (fuente de respaldo). El resultado es válido; solo cambió la fuente del listado.
+        </p>""")
 
     cuerpo = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 800px; margin: 0 auto;">
         <h2 style="color: #2c3e50;">Radar Legislativo — {fecha_hoy}</h2>
         <p><a href='{URL_PRIMERA_SECCION}'>Ver Primera Sección en el BORA</a></p>
+        {nota_fuente}
         <hr style="border: 1px solid #ecf0f1;">
     """
 
@@ -1041,7 +1173,7 @@ def enviar_aviso(titulo: str, detalle: str):
         print(f"ℹ️ AVISO (no se pudo enviar por email): {titulo} — {detalle}")
 
 
-def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None):
+def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None, fuente_usada=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     if alertas:
@@ -1051,7 +1183,8 @@ def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None
     else:
         asunto = f"✅ RADAR: Sin novedades ({fecha_hoy})"
 
-    cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html, descartadas_ia)
+    cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html,
+                                          descartadas_ia, fuente_usada)
     enviar_html(asunto, cuerpo_html)
 
 
@@ -1065,7 +1198,7 @@ def ejecutar_radar():
     print("=" * 60)
 
     df = cargar_archivo_robusto()
-    normas, leido_ok = escanear_boletin()
+    normas, leido_ok, fuente_usada = escanear_boletin()
 
     # Caso 1: no se pudo ni acceder al BORA (timeout / sitio caído). NO es una falla
     # del sistema: se manda un aviso informativo y se termina limpio (sin error rojo).
@@ -1116,7 +1249,7 @@ def ejecutar_radar():
     if INCLUIR_LISTADO_BOLETIN:
         listado_html = construir_html_listado(normas)
 
-    enviar_email(alertas, normas_ignoradas, listado_html, descartadas_ia)
+    enviar_email(alertas, normas_ignoradas, listado_html, descartadas_ia, fuente_usada)
 
 
 if __name__ == "__main__":
