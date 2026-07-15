@@ -41,8 +41,13 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 # Si querés más matiz de razonamiento: GEMINI_MODEL=gemini-2.5-flash.
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-flash-lite'
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-IA_DELAY_SEGUNDOS = 4.0      # pausa entre consultas para respetar el límite por minuto del tier gratuito
+IA_DELAY_SEGUNDOS = 6.0      # pausa entre consultas para respetar el límite por minuto del tier gratuito
 IA_MAX_CHARS_NORMA = 8000    # recorte del texto de la norma que se manda a la IA
+# Topes para no pasarnos de la cuota gratuita de Gemini:
+IA_MAX_CONSULTAS = 20        # máximo de consultas a la IA por corrida
+IA_MAX_POR_CASO = 4          # máximo de normas por caso que se mandan a la IA (evita
+                             # que una tanda —p. ej. 15 asignaciones de frecuencias—
+                             # consuma toda la cuota confirmando lo mismo una y otra vez)
 
 # --- CONFIGURACIÓN GENERAL ---
 NOMBRE_ARCHIVO_BASE = 'seguimiento_desregulacion_estandarizado'
@@ -410,28 +415,48 @@ def leer_base_google_sheets():
         print(f"❌ {msg}")
         enviar_alerta_error("Faltan credenciales de Google Sheets", msg)
         sys.exit(1)
-    try:
-        import json
-        import gspread
-        from google.oauth2.service_account import Credentials
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(NOMBRE_HOJA_EXCEL)
-        df = pd.DataFrame(ws.get_all_records())  # fila 1 = encabezados
-        if df.empty:
-            raise ValueError("La hoja se leyó pero no tiene filas de datos.")
-        print(f"☁️  Base leída desde Google Sheets: {len(df)} filas.")
-        return df
-    except Exception as e:
-        msg = (f"No se pudo leer la base desde Google Sheets: {e}. Verificá que la "
-               f"planilla esté compartida con el email de la cuenta de servicio, que el "
-               f"ID y el nombre de hoja ('{NOMBRE_HOJA_EXCEL}') sean correctos, y que la "
-               f"API de Google Sheets esté habilitada.")
-        print(f"❌ {msg}")
-        enviar_alerta_error("Error leyendo Google Sheets", msg)
-        sys.exit(1)
+    import json
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    # Google a veces devuelve 500/503 (backend saturado) o 429 (cuota) de forma
+    # TRANSITORIA. No es un problema de configuración: reintentamos con esperas
+    # crecientes antes de dar la lectura por fallida (evita corridas truncas y el
+    # mail de alerta espurio que después genera un duplicado).
+    TRANSITORIOS = ('500', '502', '503', '504', '429', 'timeout', 'timed out',
+                    'connection', 'temporarily', 'unavailable')
+    esperas = [0, 6, 15, 30]
+    ultimo_error = None
+    for intento, espera in enumerate(esperas, 1):
+        if espera:
+            print(f"   ↻ Reintentando lectura de Google Sheets en {espera}s "
+                  f"(intento {intento}/{len(esperas)})...")
+            time.sleep(espera)
+        try:
+            info = json.loads(GOOGLE_CREDENTIALS_JSON)
+            scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            gc = gspread.authorize(creds)
+            ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(NOMBRE_HOJA_EXCEL)
+            df = pd.DataFrame(ws.get_all_records())  # fila 1 = encabezados
+            if df.empty:
+                raise ValueError("La hoja se leyó pero no tiene filas de datos.")
+            print(f"☁️  Base leída desde Google Sheets: {len(df)} filas.")
+            return df
+        except Exception as e:
+            ultimo_error = e
+            es_transitorio = any(t in str(e).lower() for t in TRANSITORIOS)
+            if not es_transitorio:
+                break   # error de configuración/permiso: no tiene sentido reintentar
+            print(f"   ⚠️  Bache transitorio de Google Sheets: {e}")
+
+    msg = (f"No se pudo leer la base desde Google Sheets tras varios intentos: "
+           f"{ultimo_error}. Verificá que la planilla esté compartida con el email de la "
+           f"cuenta de servicio, que el ID y el nombre de hoja ('{NOMBRE_HOJA_EXCEL}') "
+           f"sean correctos, y que la API de Google Sheets esté habilitada.")
+    print(f"❌ {msg}")
+    enviar_alerta_error("Error leyendo Google Sheets", msg)
+    sys.exit(1)
 
 
 def cargar_archivo_robusto():
@@ -785,9 +810,9 @@ def _consultar_gemini(prompt: str) -> str:
 
     # Errores de configuración (no tiene sentido reintentar): key/modelo/permiso.
     NO_REINTENTAR = (400, 401, 403, 404)
-    # Esperas crecientes ante fallos transitorios: 503 (saturado), 429 (cupo por
-    # minuto), 5xx o errores de red. Primer intento sin espera.
-    esperas = [0, 5, 12, 25]
+    # Esperas crecientes solo ante fallos TRANSITORIOS (503 saturado, 5xx, red).
+    # El 429 (cuota) NO se reintenta: reintentar quema más cuota y alarga la corrida.
+    esperas = [0, 5, 12]
     ultimo_error = None
     for espera in esperas:
         if espera:
@@ -800,8 +825,12 @@ def _consultar_gemini(prompt: str) -> str:
         if r.status_code in NO_REINTENTAR:
             # Surface el mensaje real (key inválida, modelo inexistente…) y cortar ya.
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code == 429:
+            # Cuota agotada (por minuto o por día). Cortar de una: el que llama
+            # detecta "CUOTA" y deja de consultar a la IA por el resto de la corrida.
+            raise RuntimeError(f"CUOTA (HTTP 429): {r.text[:140]}")
         if r.status_code != 200:
-            # 429 / 503 / 5xx: transitorio → reintentar con más espera.
+            # 503 / 5xx: transitorio → reintentar con más espera.
             ultimo_error = RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
             continue
         data = r.json()
@@ -820,24 +849,31 @@ def _consultar_gemini(prompt: str) -> str:
 
 
 def confirmar_con_ia(id_caso, accion, desc_caso, texto_norma):
-    """Le pregunta a Gemini si la norma se refiere ESPECÍFICAMENTE al caso.
-    Devuelve (coincide, razon). coincide es True/False, o None si la IA falló."""
+    """Le pregunta a Gemini DOS cosas: si la norma coincide con el caso, y si además
+    lo DEROGA/MODIFICA/SUSTITUYE (afecta) o solo lo reglamenta/menciona.
+    Devuelve (coincide, afecta, razon). Cada bool puede ser None si la IA no pudo."""
     import json
     prompt = f"""Sos analista de políticas públicas de la Fundación Libertad y Progreso. \
-Seguimos una lista de normas y organismos que proponemos desregular (modificar, derogar, eliminar, crear o reglamentar).
+Seguimos una lista de normas y organismos que proponemos desregular (derogar, modificar, eliminar, crear o reglamentar).
 
-Te paso UN caso que seguimos y el TEXTO de una norma publicada hoy en el Boletín Oficial. \
-Tu tarea es decidir si esta norma del Boletín TIENE POR OBJETO actuar sobre lo del caso.
+Te paso UN caso que seguimos (con la ACCIÓN que proponemos) y el TEXTO de una norma publicada hoy en el Boletín Oficial. \
+Respondé DOS cosas en un JSON:
 
-- Respondé "coincide": true SOLO si el objeto de la norma es modificar, derogar, sustituir, crear, \
-disolver o reglamentar la norma, el organismo o el régimen del caso (o cambiar directamente sus reglas).
-- Respondé "coincide": false si la norma solo MENCIONA, CITA, INVOCA, APLICA o USA esa norma u organismo \
-como parte de otro trámite: por ejemplo, lo cita como fundamento legal, le pide un dictamen o una tasación, \
-nombra al organismo como autor de un acto de rutina, o apenas comparte vocabulario o temática. \
-Mencionar o usar NO es lo mismo que reformar.
+1) "coincide": true SOLO si la norma TIENE POR OBJETO actuar sobre la norma, el organismo o el régimen del caso \
+(modificarlo, derogarlo, sustituirlo, crearlo, disolverlo o reglamentarlo). \
+"coincide": false si solo MENCIONA, CITA, INVOCA, APLICA o USA eso como parte de otro trámite (lo cita como \
+fundamento, pide un dictamen, nombra al organismo como autor de un acto de rutina, o solo comparte tema/vocabulario). \
+Mencionar o usar NO es coincidir.
 
-Ejemplo: si el caso busca ELIMINAR el "Tribunal de Tasaciones de la Nación", una norma que simplemente \
-le solicita al Tribunal un dictamen de valor para administrar un bien es coincide:false (lo usa, no lo reforma).
+2) "afecta": true si la norma DEROGA, MODIFICA, SUSTITUYE o ELIMINA la norma, el artículo o la obligación del caso \
+(cambia efectivamente sus reglas). "afecta": false si es del mismo tema pero NO la deroga ni la modifica (por ejemplo, \
+solo la REGLAMENTA, la aplica o la menciona). Si no podés determinarlo, poné "afecta": null.
+
+Ejemplos:
+- Caso: eliminar el "Tribunal de Tasaciones". Norma que le pide un dictamen de valor → coincide:false.
+- Caso: derogar el artículo sobre incumbencias profesionales de la Ley 26.522. Norma que REGLAMENTA esas \
+incumbencias → coincide:true, afecta:false (es del tema, pero no deroga ni modifica ese artículo).
+- La misma norma, pero que DEROGA o MODIFICA ese artículo → coincide:true, afecta:true.
 
 CASO {id_caso} (acción que proponemos: {accion}):
 {desc_caso}
@@ -846,63 +882,98 @@ NORMA DEL BOLETÍN:
 {texto_norma[:IA_MAX_CHARS_NORMA]}
 
 Respondé SOLO con un JSON válido, sin texto adicional:
-{{"coincide": true, "razon": "<frase breve indicando QUÉ norma/artículo/organismo modifica>"}}  ó  {{"coincide": false, "razon": "<frase breve, p. ej. 'solo lo menciona/usa, no lo reforma'>"}}"""
+{{"coincide": true|false, "afecta": true|false|null, "razon": "<frase breve; si afecta=false aclará que solo lo reglamenta/menciona>"}}"""
     try:
         txt = _consultar_gemini(prompt).strip()
         m = re.search(r'\{.*\}', txt, re.DOTALL)
         if not m:
             # Respuesta sin JSON: incierto → None (se conserva para revisión manual).
-            return None, f"respuesta no interpretable: {txt[:120]}"
+            return None, None, f"respuesta no interpretable: {txt[:120]}"
         obj = json.loads(m.group(0))
-        # Solo descartamos ante un 'false' EXPLÍCITO; cualquier otra cosa = incierto.
         if 'coincide' not in obj:
-            return None, f"sin campo coincide: {txt[:120]}"
-        return bool(obj.get('coincide')), str(obj.get('razon', ''))[:300]
+            return None, None, f"sin campo coincide: {txt[:120]}"
+        coincide = bool(obj.get('coincide'))
+        afecta_raw = obj.get('afecta', None)
+        afecta = None if afecta_raw is None else bool(afecta_raw)
+        return coincide, afecta, str(obj.get('razon', ''))[:300]
     except Exception as e:
-        return None, f"error: {e}"
+        return None, None, f"error: {e}"
 
 
 def confirmar_alertas_con_ia(alertas):
-    """Revisa cada candidata con la IA. Devuelve (confirmadas, descartadas).
-    Ante un error de IA, NO descarta la candidata (la conserva marcada para revisión
-    manual): preferimos un falso positivo a perder una coincidencia real."""
+    """Revisa cada candidata con la IA. Devuelve (confirmadas, revisar, descartadas):
+      - confirmadas: del tema y (si es un caso de DEROGACIÓN) que además deroga/modifica.
+      - revisar: caso de DEROGACIÓN, del tema, pero la norma NO deroga ni modifica el
+        objetivo (solo lo reglamenta/menciona). No se descarta: va en gris/naranja.
+      - descartadas: no relacionadas.
+    Ante un error/duda de la IA, NO se pierde la candidata (queda en 'confirmadas' con nota)."""
     if not GEMINI_API_KEY:
         msg = ("USAR_IA está activado pero falta GEMINI_API_KEY. Se envían las "
                "coincidencias por keywords sin el filtro de IA. Cargá el secret "
                "GEMINI_API_KEY o poné USAR_IA=false.")
         print(f"  ⚠️  {msg}")
         enviar_alerta_error("IA activada sin GEMINI_API_KEY", msg)
-        return alertas, []
+        return alertas, [], []
 
-    confirmadas, descartadas, errores = [], [], 0
+    # Repartir candidatas para NO pasarnos de la cuota: se mandan a la IA hasta
+    # IA_MAX_POR_CASO por caso y IA_MAX_CONSULTAS en total. El resto queda "sin
+    # revisar" (se conserva arriba con nota; no se pierde nada).
+    a_revisar_ia, sin_revisar, vistos_por_caso = [], [], {}
     for a in alertas:
+        cid = a['ID']
+        vistos_por_caso[cid] = vistos_por_caso.get(cid, 0) + 1
+        if vistos_por_caso[cid] <= IA_MAX_POR_CASO and len(a_revisar_ia) < IA_MAX_CONSULTAS:
+            a_revisar_ia.append(a)
+        else:
+            sin_revisar.append(a)
+
+    confirmadas, revisar, descartadas, errores = [], [], [], 0
+    cuota_agotada = False
+    for i, a in enumerate(a_revisar_ia):
+        es_derogacion = 'DEROG' in (a.get('ACCION') or '').upper()
         desc = (f"Organismo: {a.get('ORGANISMO', '')}. "
                 f"Norma objetivo: {a.get('NUMERO_NORMA', '')}. "
                 f"Términos del caso: {', '.join(a['KEYWORDS_ENCONTRADAS'])}.")
-        coincide, razon = confirmar_con_ia(a['ID'], a['ACCION'], desc, a.get('TEXTO_NORMA', ''))
+        coincide, afecta, razon = confirmar_con_ia(a['ID'], a['ACCION'], desc, a.get('TEXTO_NORMA', ''))
+        # Cuota agotada: dejar de consultar la IA por el resto de la corrida.
+        if coincide is None and 'CUOTA' in (razon or '').upper():
+            cuota_agotada = True
+            print(f"  🤖 {a['ID']}: 🚫 cuota de IA agotada — se deja de consultar por hoy")
+            sin_revisar.extend(a_revisar_ia[i:])   # este y los que faltan quedan sin revisar
+            break
         a['IA_RAZON'] = razon
         if coincide is None:
             errores += 1
             a['IA_RAZON'] = f"IA no disponible ({razon}); revisar manualmente"
-            confirmadas.append(a)
-        elif coincide:
-            confirmadas.append(a)
+            confirmadas.append(a); estado = "⚠️ sin respuesta"
+        elif not coincide:
+            descartadas.append(a); estado = "✖ descarta"
+        elif es_derogacion and afecta is False:
+            a['IA_RAZON'] = razon or "es del tema pero no se identificó derogación ni modificación"
+            revisar.append(a); estado = "🔶 para revisar (sin derogación/modificación)"
         else:
-            descartadas.append(a)
-        if coincide is None:
-            print(f"  🤖 {a['ID']}: ⚠️ sin respuesta — {razon}")
-        else:
-            print(f"  🤖 {a['ID']}: {'✅ confirma' if coincide else '✖ descarta'} — {razon}")
+            confirmadas.append(a); estado = "✅ confirma"
+        print(f"  🤖 {a['ID']}: {estado} — {razon}")
         time.sleep(IA_DELAY_SEGUNDOS)
 
-    print(f"  🤖 IA: {len(confirmadas)} confirmadas, {len(descartadas)} descartadas, "
-          f"{errores} sin respuesta (de {len(alertas)} candidatas).")
-    if alertas and errores == len(alertas):
+    # Candidatas no revisadas por IA (tope por caso/total o cuota): se conservan
+    # arriba con nota, para no perder ninguna coincidencia real.
+    for a in sin_revisar:
+        if not a.get('IA_RAZON'):
+            a['IA_RAZON'] = ("no revisada por IA (tanda del día / tope de cuota); "
+                             "revisar manualmente")
+        confirmadas.append(a)
+
+    print(f"  🤖 IA: {len(confirmadas)} firmes, {len(revisar)} para revisar, "
+          f"{len(descartadas)} descartadas | {len(sin_revisar)} sin revisar por IA "
+          f"(cuota_agotada={cuota_agotada}).")
+    if cuota_agotada:
         enviar_alerta_error(
-            "La IA no respondió en ninguna consulta",
-            "Ninguna consulta a Gemini tuvo éxito (revisá GEMINI_API_KEY, el modelo o la "
-            "cuota). Se enviaron las coincidencias por keywords sin filtrar.")
-    return confirmadas, descartadas
+            "Cuota de IA agotada hoy",
+            "Se agotó la cuota gratuita de Gemini y varias coincidencias quedaron SIN "
+            "revisar por IA (se muestran igual, marcadas). Suele resetearse al día "
+            "siguiente; si pasa seguido, conviene subir el modelo/plan o afinar keywords.")
+    return confirmadas, revisar, descartadas
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -985,7 +1056,7 @@ def construir_html_listado(normas):
 
 
 def construir_email_completo(alertas, normas_ignoradas, listado_html="", descartadas_ia=None,
-                             fuente_usada=None):
+                             fuente_usada=None, revisar_ia=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     # Nota de fuente: si se usó el fallback (Vigía no disponible), avisarlo arriba.
@@ -1047,12 +1118,38 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
     else:
         cuerpo += """
         <p style="color: #27ae60; font-weight: bold; margin-bottom: 4px;">
-            ✅ El Boletín de hoy se leyó con éxito, pero no hubo coincidencias con la base.
+            ✅ El Boletín de hoy se leyó con éxito, pero no hubo coincidencias firmes con la base.
         </p>
         <p style="color: #7f8c8d; font-size: 13px; margin-top: 0;">
             Igual se sugiere una revisión manual del listado de abajo por las dudas.
         </p>
         """
+
+    # Para revisar: casos de DEROGACIÓN del tema pero donde la IA no vio derogación
+    # ni modificación (solo reglamentación/mención). No se descartan: van en naranja.
+    if revisar_ia:
+        cuerpo += f"""
+        <div style="background-color:#fef5e7; border:1px solid #e67e22;
+                    border-radius:6px; padding:12px 15px; margin:15px 0;">
+            <h4 style="color:#ca6f1e; margin:0 0 8px 0;">
+                🔶 {len(revisar_ia)} para revisar — relacionadas pero sin derogación/modificación clara
+            </h4>
+            <p style="color:#7f8c8d; font-size:12px; margin-top:0;">
+                Son del tema de un caso de derogación, pero la IA no detectó que la norma
+                derogue ni modifique el objetivo (podría solo reglamentarlo o mencionarlo).
+                Revisalas por las dudas.
+            </p>
+        """
+        for r in revisar_ia:
+            cuerpo += f"""
+            <div style="margin:8px 0 8px 10px; font-size:12px; color:#5d6d7e;">
+                <b>{r['ID']}</b> — Acción: {r['ACCION']}<br>
+                {r['TITULO']}<br>
+                🤖 {r.get('IA_RAZON', '')}
+                — <a href='{r['URL']}' style="font-size:11px;">ver norma</a>
+            </div>
+            """
+        cuerpo += "</div>"
 
     # Candidatas que la IA descartó (se muestran para poder auditar la IA).
     if descartadas_ia:
@@ -1173,18 +1270,21 @@ def enviar_aviso(titulo: str, detalle: str):
         print(f"ℹ️ AVISO (no se pudo enviar por email): {titulo} — {detalle}")
 
 
-def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None, fuente_usada=None):
+def enviar_email(alertas, normas_ignoradas, listado_html="", descartadas_ia=None,
+                 fuente_usada=None, revisar_ia=None):
     fecha_hoy = date.today().strftime('%d/%m/%Y')
 
     if alertas:
         asunto = f"🔴 RADAR: {len(alertas)} coincidencia(s) en el BORA ({fecha_hoy})"
+    elif revisar_ia:
+        asunto = f"🔶 RADAR: {len(revisar_ia)} para revisar en el BORA ({fecha_hoy})"
     elif listado_html:
         asunto = f"📋 Resumen del Boletín Oficial ({fecha_hoy})"
     else:
         asunto = f"✅ RADAR: Sin novedades ({fecha_hoy})"
 
     cuerpo_html = construir_email_completo(alertas, normas_ignoradas, listado_html,
-                                          descartadas_ia, fuente_usada)
+                                          descartadas_ia, fuente_usada, revisar_ia)
     enviar_html(asunto, cuerpo_html)
 
 
@@ -1231,10 +1331,12 @@ def ejecutar_radar():
     # El filtro de keywords ya preseleccionó candidatas; la IA descarta las que
     # solo comparten vocabulario. Apagada por defecto (USAR_IA).
     descartadas_ia = []
+    revisar_ia = []
     if USAR_IA and alertas:
         print(f"\n🤖 Confirmando {len(alertas)} candidata(s) con IA ({GEMINI_MODEL})...")
-        alertas, descartadas_ia = confirmar_alertas_con_ia(alertas)
-        print(f"📊 Tras IA: {len(alertas)} confirmadas, {len(descartadas_ia)} descartadas.")
+        alertas, revisar_ia, descartadas_ia = confirmar_alertas_con_ia(alertas)
+        print(f"📊 Tras IA: {len(alertas)} firmes, {len(revisar_ia)} para revisar, "
+              f"{len(descartadas_ia)} descartadas.")
 
     # Salvaguarda: un número anómalo de coincidencias sugiere una regresión.
     if len(alertas) > MAX_ALERTAS_RAZONABLE:
@@ -1249,7 +1351,7 @@ def ejecutar_radar():
     if INCLUIR_LISTADO_BOLETIN:
         listado_html = construir_html_listado(normas)
 
-    enviar_email(alertas, normas_ignoradas, listado_html, descartadas_ia, fuente_usada)
+    enviar_email(alertas, normas_ignoradas, listado_html, descartadas_ia, fuente_usada, revisar_ia)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,12 @@ on:
     - cron: '10 11 * * 1-5'   # 08:10 ARG
     - cron: '5 12 * * 1-5'    # 09:05 ARG
     - cron: '0 13 * * 1-5'    # 10:00 ARG
-  workflow_dispatch:           # ejecución manual (siempre corre, sin importar el control)
+  workflow_dispatch:           # ejecución manual y disparador externo (cron-job.org)
+    inputs:
+      forzar:
+        description: "Forzar el envío aunque ya se haya enviado hoy"
+        type: boolean
+        default: false
 
 # Que no se solapen dos corridas (los horarios están separados, pero por las dudas).
 concurrency:
@@ -32,9 +37,16 @@ jobs:
         id: chequeo
         run: |
           HOY=$(TZ='America/Argentina/Buenos_Aires' date +%F)
-          if [ "${{ github.event_name }}" = "schedule" ] && [ -f .ultimo_envio ] && [ "$(cat .ultimo_envio)" = "$HOY" ]; then
+          # El control aplica a TODOS los disparadores (cron interno de GitHub y
+          # disparador externo por workflow_dispatch). Así, si dos disparadores
+          # coinciden el mismo día, solo el primero envía y el resto se omite.
+          # Excepción: una ejecución manual con forzar=true siempre corre.
+          if [ "${{ github.event.inputs.forzar }}" = "true" ]; then
+            echo "correr=si" >> "$GITHUB_OUTPUT"
+            echo "▶️  Ejecución forzada: corre aunque ya se haya enviado hoy."
+          elif [ -f .ultimo_envio ] && [ "$(cat .ultimo_envio)" = "$HOY" ]; then
             echo "correr=no" >> "$GITHUB_OUTPUT"
-            echo "✅ Ya se envió hoy ($HOY). Se omite esta corrida programada."
+            echo "✅ Ya se envió hoy ($HOY). Se omite esta corrida."
           else
             echo "correr=si" >> "$GITHUB_OUTPUT"
           fi
