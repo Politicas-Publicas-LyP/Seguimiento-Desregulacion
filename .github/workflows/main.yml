@@ -110,6 +110,11 @@ jobs:
           VIGIA_API_TOKEN: ${{ secrets.VIGIA_API_TOKEN }}
           # --- Reintentos ante BORA inaccesible ---
           ULTIMO_INTENTO: ${{ steps.intento.outputs.ultimo }}
+          # --- Proxy de lectura del BORA (Cloudflare Worker) ---
+          # Variable BORA_PROXY_URL = https://bora-proxy-sam.politicaspublicas.workers.dev/
+          # Secret BORA_PROXY_TOKEN = la misma clave cargada como TOKEN en Cloudflare.
+          BORA_PROXY_URL: ${{ vars.BORA_PROXY_URL }}
+          BORA_PROXY_TOKEN: ${{ secrets.BORA_PROXY_TOKEN }}
         run: python radar_automatico.py
 
       - name: Marcar que ya se envió hoy

@@ -87,6 +87,19 @@ FUENTE_PRIMARIA = (os.environ.get('FUENTE_PRIMARIA') or 'vigia').lower()
 # es el último intento, el radar no manda aviso ni marca el día como enviado: el
 # próximo horario vuelve a probar. Por defecto 'true' (corridas locales = como antes).
 ULTIMO_INTENTO = (os.environ.get('ULTIMO_INTENTO') or 'true').lower() == 'true'
+
+# ─── PROXY DE LECTURA DEL BORA (Cloudflare) ──────────────────────────────────
+# Desde oct-2026 el BORA rechaza casi todas las conexiones desde servidores del
+# exterior (GitHub Actions incluido). Si BORA_PROXY_URL está definida, TODAS las
+# lecturas del BORA (índice y fichas) pasan por el Worker 'bora-proxy-sam'
+# (carpeta cloudflare-proxy/), que las hace desde un Durable Object de Cloudflare.
+# Si un 'lector' no conecta, se prueba con el siguiente y se sigue con el que anda.
+BORA_PROXY_URL = (os.environ.get('BORA_PROXY_URL') or '').strip().rstrip('/')
+BORA_PROXY_TOKEN = os.environ.get('BORA_PROXY_TOKEN', '')
+BORA_PROXY_LECTORES = [f"lector-{i}" for i in range(1, 9)]
+BORA_PROXY_TIMEOUT = 75          # cada intento fallido tarda ~40 s en Cloudflare
+BORA_PROXY_MAX_FALLOS = 2        # tras N URLs sin ningún lector OK, se deja de insistir
+_proxy_estado = {'idx': 0, 'fallos_seguidos': 0}
 VIGIA_API_BASE = (os.environ.get('VIGIA_API_BASE') or 'https://vigia-api.openarg.org').rstrip('/')
 # Token opcional (los endpoints de datos de Vigía son públicos; no hace falta hoy).
 VIGIA_API_TOKEN = os.environ.get('VIGIA_API_TOKEN', '')
@@ -318,7 +331,31 @@ def es_keyword_valida(keyword: str) -> bool:
     return True
 
 
+def _get_via_proxy(url):
+    """Lee una URL del BORA a través del Worker de Cloudflare, rotando lectores."""
+    if _proxy_estado['fallos_seguidos'] >= BORA_PROXY_MAX_FALLOS:
+        return None   # el proxy viene fallando: no gastar minutos en cada ficha
+    h = {'X-Token': BORA_PROXY_TOKEN} if BORA_PROXY_TOKEN else {}
+    for _ in range(len(BORA_PROXY_LECTORES)):
+        nombre = BORA_PROXY_LECTORES[_proxy_estado['idx']]
+        try:
+            r = requests.get(BORA_PROXY_URL, params={'url': url, 'n': nombre},
+                             headers=h, timeout=BORA_PROXY_TIMEOUT)
+            if r.status_code < 500:
+                _proxy_estado['fallos_seguidos'] = 0
+                return r
+            print(f"  ⚠️  Proxy ({nombre}): status {r.status_code}; pruebo otro lector")
+        except requests.exceptions.RequestException as e:
+            print(f"  ⚠️  Proxy ({nombre}): error de red ({e}); pruebo otro lector")
+        _proxy_estado['idx'] = (_proxy_estado['idx'] + 1) % len(BORA_PROXY_LECTORES)
+    _proxy_estado['fallos_seguidos'] += 1
+    print(f"  ❌ Ningún lector del proxy pudo leer {url}")
+    return None
+
+
 def get_con_reintentos(url, headers, timeout=15, intentos=3, espera=5):
+    if BORA_PROXY_URL and 'boletinoficial.gob.ar' in url:
+        return _get_via_proxy(url)
     for intento in range(1, intentos + 1):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
