@@ -1,0 +1,11 @@
+{
+  // Worker de prueba: ejecuta la lectura del BORA dentro de un Durable Object
+  // ubicado en Sudamérica (locationHint "sam"), para salir con una IP regional.
+  "name": "bora-proxy-sam",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "durable_objects": {
+    "bindings": [{ "name": "LECTOR", "class_name": "LectorBORA" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LectorBORA"] }]
+}
