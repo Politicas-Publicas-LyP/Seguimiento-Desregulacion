@@ -80,6 +80,13 @@ URL_PRIMERA_SECCION = f"{URL_BORA_BASE}/seccion/primera"
 # En AMBOS casos el matching corre sobre el TEXTO COMPLETO bajado de la ficha del
 # BORA (diseño híbrido): Vigía aporta la LISTA del día, no reemplaza el texto.
 FUENTE_PRIMARIA = (os.environ.get('FUENTE_PRIMARIA') or 'vigia').lower()
+
+# ─── REINTENTOS ANTE BORA INACCESIBLE ────────────────────────────────────────
+# Lo define el workflow: 'false' en los horarios tempranos, 'true' en el último
+# horario del día (o en una ejecución manual forzada). Si el BORA no responde y NO
+# es el último intento, el radar no manda aviso ni marca el día como enviado: el
+# próximo horario vuelve a probar. Por defecto 'true' (corridas locales = como antes).
+ULTIMO_INTENTO = (os.environ.get('ULTIMO_INTENTO') or 'true').lower() == 'true'
 VIGIA_API_BASE = (os.environ.get('VIGIA_API_BASE') or 'https://vigia-api.openarg.org').rstrip('/')
 # Token opcional (los endpoints de datos de Vigía son públicos; no hace falta hoy).
 VIGIA_API_TOKEN = os.environ.get('VIGIA_API_TOKEN', '')
@@ -1303,6 +1310,15 @@ def ejecutar_radar():
     # Caso 1: no se pudo ni acceder al BORA (timeout / sitio caído). NO es una falla
     # del sistema: se manda un aviso informativo y se termina limpio (sin error rojo).
     if not leido_ok:
+        if not ULTIMO_INTENTO:
+            # No es el último horario: no avisar ni marcar el día, para reintentar.
+            salida = os.environ.get('GITHUB_OUTPUT')
+            if salida:
+                with open(salida, 'a', encoding='utf-8') as f:
+                    f.write("reintentar=si\n")
+            print("ℹ️ BORA inaccesible. No es el último intento del día: sin aviso y "
+                  "sin marcar el envío; el próximo horario vuelve a probar.")
+            return
         enviar_aviso(
             "No se pudo acceder al Boletín Oficial hoy",
             "El radar intentó leer la Primera Sección del BORA pero no obtuvo respuesta "

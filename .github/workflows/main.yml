@@ -10,6 +10,7 @@ on:
     - cron: '10 11 * * 1-5'   # 08:10 ARG
     - cron: '5 12 * * 1-5'    # 09:05 ARG
     - cron: '0 13 * * 1-5'    # 10:00 ARG
+    - cron: '20 14 * * 1-5'   # 11:20 ARG — último intento si el BORA no respondió antes
   workflow_dispatch:           # ejecución manual y disparador externo (cron-job.org)
     inputs:
       forzar:
@@ -63,7 +64,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: ¿Es el último intento del día?
+        id: intento
+        if: steps.chequeo.outputs.correr == 'si'
+        run: |
+          # Desde las 11:00 ARG (o en una ejecución forzada) es el último intento:
+          # si el BORA no responde, se manda el aviso de revisión manual. Antes de
+          # esa hora, un BORA inaccesible no avisa ni marca el día: se reintenta.
+          HORA=$(TZ='America/Argentina/Buenos_Aires' date +%H)
+          if [ "${{ github.event.inputs.forzar }}" = "true" ] || [ $((10#$HORA)) -ge 11 ]; then
+            echo "ultimo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ultimo=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Ejecutar el Radar
+        id: radar
         if: steps.chequeo.outputs.correr == 'si'
         env:
           EMAIL_ORIGEN: ${{ secrets.EMAIL_ORIGEN }}
@@ -92,11 +108,14 @@ jobs:
           FUENTE_PRIMARIA: ${{ vars.FUENTE_PRIMARIA }}
           VIGIA_API_BASE: ${{ vars.VIGIA_API_BASE }}
           VIGIA_API_TOKEN: ${{ secrets.VIGIA_API_TOKEN }}
+          # --- Reintentos ante BORA inaccesible ---
+          ULTIMO_INTENTO: ${{ steps.intento.outputs.ultimo }}
         run: python radar_automatico.py
 
       - name: Marcar que ya se envió hoy
-        # Solo si el Radar corrió y terminó OK (no en errores de configuración).
-        if: steps.chequeo.outputs.correr == 'si' && success()
+        # Solo si el Radar corrió y terminó OK (no en errores de configuración), y
+        # no si el BORA no respondió en un horario temprano (queda para reintentar).
+        if: steps.chequeo.outputs.correr == 'si' && success() && steps.radar.outputs.reintentar != 'si'
         run: |
           TZ='America/Argentina/Buenos_Aires' date +%F > .ultimo_envio
           git config user.name  "radar-bot"
