@@ -1,0 +1,19 @@
+name: Probar proxy Cloudflare (diagnóstico)
+
+# Prueba manual: ¿el BORA responde a través del Worker de Cloudflare cuando lo
+# llama GitHub (desde EE.UU.)? Se corre a mano desde la pestaña Actions.
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al Worker 3 veces
+        run: |
+          for i in 1 2 3; do
+            echo "── Intento $i ──"
+            curl -sS -m 90 https://bora-proxy.politicaspublicas.workers.dev/ || echo "FALLÓ la llamada al Worker"
+            echo
+            sleep 5
+          done
