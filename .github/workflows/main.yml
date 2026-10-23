@@ -126,5 +126,7 @@ jobs:
           git config user.name  "radar-bot"
           git config user.email "actions@github.com"
           git add .ultimo_envio
+          # Último lector del proxy que funcionó (la próxima corrida arranca por ahí).
+          if [ -f .lector_proxy ]; then git add .lector_proxy; fi
           git commit -m "chore: marca de envío diario [skip ci]" || echo "Sin cambios que commitear."
           git push || echo "No se pudo pushear la marca."

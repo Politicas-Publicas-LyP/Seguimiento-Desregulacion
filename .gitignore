@@ -1,0 +1,22 @@
+# ───────────────────────────────────────────────────────────────────────────
+#  NUNCA subir credenciales al repositorio
+# ───────────────────────────────────────────────────────────────────────────
+# La credencial de la cuenta de servicio de Google va SOLO como secret de GitHub
+# (GOOGLE_CREDENTIALS_JSON), nunca como archivo en el repo.
+radar-bora-lyp-*.json
+*service-account*.json
+*credentials*.json
+*.key
+
+# Notas locales (listas de correos, borradores)
+Email_recievers.txt
+
+# Cachés y temporales de Python
+__pycache__/
+*.pyc
+
+# (Opcional) backups locales del Excel: descomentar si NO querés versionarlos.
+# backups/
+
+# Habilidad (no es parte del radar)
+habilidad-desregulacion-lyp/

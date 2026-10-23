@@ -10,6 +10,7 @@ import sys
 import re
 import unicodedata
 import time
+import html as _html
 
 # --- CONFIGURACIÓN DE CREDENCIALES (GitHub Secrets) ---
 EMAIL_ORIGEN = os.environ.get('EMAIL_ORIGEN')
@@ -52,6 +53,7 @@ IA_MAX_POR_CASO = 4          # máximo de normas por caso que se mandan a la IA 
 # --- CONFIGURACIÓN GENERAL ---
 NOMBRE_ARCHIVO_BASE = 'seguimiento_desregulacion_estandarizado'
 NOMBRE_HOJA_EXCEL = 'Radar'
+HOJA_EXPLICACIONES = 'Explicaciones'   # contexto de cada caso para la IA
 
 # ─── FUENTE DE LA BASE DE DATOS ──────────────────────────────────────────────
 # "excel_local"  → lee el archivo .xlsx del repositorio (comportamiento original).
@@ -100,6 +102,16 @@ BORA_PROXY_LECTORES = [f"lector-{i}" for i in range(1, 9)]
 BORA_PROXY_TIMEOUT = 75          # cada intento fallido tarda ~40 s en Cloudflare
 BORA_PROXY_MAX_FALLOS = 2        # tras N URLs sin ningún lector OK, se deja de insistir
 _proxy_estado = {'idx': 0, 'fallos_seguidos': 0}
+# Último lector que funcionó: se guarda en este archivo (lo commitea el workflow) y
+# la próxima corrida arranca por ahí, sin perder ~40 s por cada lector caído.
+ARCHIVO_LECTOR_PROXY = '.lector_proxy'
+try:
+    with open(ARCHIVO_LECTOR_PROXY, encoding='utf-8') as _f:
+        _guardado = _f.read().strip()
+    if _guardado in BORA_PROXY_LECTORES:
+        _proxy_estado['idx'] = BORA_PROXY_LECTORES.index(_guardado)
+except OSError:
+    pass
 VIGIA_API_BASE = (os.environ.get('VIGIA_API_BASE') or 'https://vigia-api.openarg.org').rstrip('/')
 # Token opcional (los endpoints de datos de Vigía son públicos; no hace falta hoy).
 VIGIA_API_TOKEN = os.environ.get('VIGIA_API_TOKEN', '')
@@ -170,6 +182,10 @@ EXCLUSIONES_RRHH = [
     "INCORPORACION", "INCORPORASE", "INCORPORANSE", "PASE A RETIRO",
     "RETIRO", "RETIROS", "HABER DE RETIRO", "JUBILACION", "RECONOCIMIENTO DE SERVICIOS",
     "DISTINCIONES", "FELICITACIONES",
+    # Variantes que el filtro por subcadena cubría de rebote y por palabra entera no.
+    "DESIGNANSE", "DASE POR DESIGNADO", "DASE POR DESIGNADA", "DANSE POR DESIGNADOS",
+    "DANSE POR DESIGNADAS", "DASE POR CONCLUIDA", "DASE POR CONCLUIDO",
+    "PRORROGANSE", "TRASLADOS", "LICENCIAS",
 ]
 
 # Tipos de norma que NO se cruzan contra la base (rutinarios: edictos, balances,
@@ -343,6 +359,11 @@ def _get_via_proxy(url):
                              headers=h, timeout=BORA_PROXY_TIMEOUT)
             if r.status_code < 500:
                 _proxy_estado['fallos_seguidos'] = 0
+                try:
+                    with open(ARCHIVO_LECTOR_PROXY, 'w', encoding='utf-8') as f:
+                        f.write(nombre + "\n")
+                except OSError:
+                    pass
                 return r
             print(f"  ⚠️  Proxy ({nombre}): status {r.status_code}; pruebo otro lector")
         except requests.exceptions.RequestException as e:
@@ -418,8 +439,25 @@ def clasificar_tipo_norma(titulo_normalizado: str) -> str:
     return "Otros"
 
 
-def es_norma_de_rrhh(titulo_normalizado: str) -> bool:
-    return any(excl in titulo_normalizado for excl in EXCLUSIONES_RRHH)
+# Coincidencia por PALABRA/FRASE ENTERA (antes era por subcadena: "CESE" saltaba
+# dentro de "PROCESES" y "RETIRO" dentro de "RETIROS DE MERCADERIA", etc.).
+_PATRON_RRHH = re.compile(r'\b(?:' + '|'.join(re.escape(e) for e in EXCLUSIONES_RRHH) + r')\b')
+# Salvaguarda: si el texto indica un cambio NORMATIVO, no se descarta como "personal"
+# aunque tenga un término de la lista (p. ej. "Régimen de Contrataciones. Modificación",
+# "Régimen de Licencias", "Retiro voluntario: reglamentación"). Preferimos revisar
+# una norma de más a perder una desregulación en silencio.
+_PATRON_NORMATIVO = re.compile(
+    r'\b(?:MODIFICACION|MODIFICASE|MODIFICANSE|DEROGASE|DEROGANSE|DEROGACION|'
+    r'SUSTITUYESE|SUSTITUYENSE|REGLAMENTACION|REGLAMENTASE|REGIMEN|REGLAMENTO|'
+    r'CREASE|DISUELVESE|SUPRIMESE|ELIMINASE)\b')
+
+
+def es_norma_de_rrhh(texto_normalizado: str) -> bool:
+    """True si el título/resumen describe un acto de personal (designación, prórroga,
+    renuncia, ascenso...). Usa palabras enteras y respeta la salvaguarda normativa."""
+    if not _PATRON_RRHH.search(texto_normalizado):
+        return False
+    return not _PATRON_NORMATIVO.search(texto_normalizado)
 
 
 def parsear_destinatarios(email_destino_raw: str) -> list:
@@ -729,6 +767,12 @@ def escanear_boletin():
                          f"{norma.get('VIGIA_RESUMEN_IA', '')} {resumen} {cuerpo}")
             norma['TEXTO_MATCH'] = normalizar_texto(combinado)
             norma['TEXTO_ORIGINAL'] = combinado
+            # Con el listado del BORA el título casi no trae descripción ("Organismo –
+            # Disposición 88/2026"): se re-evalúa el filtro de personal con el resumen
+            # oficial de la ficha (y el de Vigía, si hay), no con el cuerpo completo.
+            if not norma['ES_RRHH'] and es_norma_de_rrhh(normalizar_texto(
+                    f"{norma['TEXTO']} {norma.get('VIGIA_RESUMEN', '')} {resumen}")):
+                norma['ES_RRHH'] = True
             if i % 15 == 0:
                 print(f"     ... {i}/{len(sustantivas)} leídas ({fallos} fallidas)")
             time.sleep(BORA_DELAY_SEGUNDOS)
@@ -842,8 +886,12 @@ def cruzar_con_base(normas, df):
 def _consultar_gemini(prompt: str) -> str:
     """Hace una consulta a la API de Gemini y devuelve el texto de la respuesta.
     Lanza una excepción con el motivo concreto si algo falla (para diagnóstico)."""
-    url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    generation_config = {"temperature": 0, "maxOutputTokens": 600}
+    url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent"
+    # La key va en un header (no en la URL) para que nunca aparezca en mensajes de
+    # error, que terminan en el log público de Actions o en el email.
+    headers_ia = {"x-goog-api-key": GEMINI_API_KEY}
+    generation_config = {"temperature": 0, "maxOutputTokens": 600,
+                         "responseMimeType": "application/json"}
     # Los modelos flash "completos" 2.5/3 "piensan" por defecto y se comen el
     # presupuesto de tokens dejando la respuesta vacía. Desactivamos ese pensamiento.
     # flash-lite ya viene sin pensamiento, así que NO le mandamos el parámetro
@@ -862,7 +910,7 @@ def _consultar_gemini(prompt: str) -> str:
         if espera:
             time.sleep(espera)
         try:
-            r = requests.post(url, json=body, timeout=40)
+            r = requests.post(url, json=body, headers=headers_ia, timeout=40)
         except requests.exceptions.RequestException as e:
             ultimo_error = RuntimeError(f"red: {e}")
             continue
@@ -892,32 +940,86 @@ def _consultar_gemini(prompt: str) -> str:
     raise ultimo_error
 
 
+def leer_explicaciones():
+    """Devuelve {ID_CASO: texto} con la explicación de cada caso (hoja "Explicaciones":
+    columnas Nº / Propuesta / Normativa / Resumen). Le da a la IA el CONTEXTO de qué
+    proponemos en cada caso. Nunca corta la corrida: ante cualquier problema, {}."""
+    try:
+        if FUENTE_DATOS == 'google_sheets' and GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_JSON:
+            import json
+            import gspread
+            from google.oauth2.service_account import Credentials
+            creds = Credentials.from_service_account_info(
+                json.loads(GOOGLE_CREDENTIALS_JSON),
+                scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+            filas = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID) \
+                .worksheet(HOJA_EXPLICACIONES).get_all_values()
+        else:
+            d = pd.read_excel(f"{NOMBRE_ARCHIVO_BASE}.xlsx", sheet_name=HOJA_EXPLICACIONES,
+                              header=None, dtype=str).fillna('')
+            filas = d.values.tolist()
+        # Buscar la fila de encabezados (la que tiene "Resumen").
+        cab = next(i for i, f in enumerate(filas)
+                   if any(normalizar_texto(str(c)) == 'RESUMEN' for c in f))
+        enc = [normalizar_texto(str(c)) for c in filas[cab]]
+        c_id = 0
+        c_res = enc.index('RESUMEN')
+        c_prop = enc.index('PROPUESTA') if 'PROPUESTA' in enc else None
+        c_norm = enc.index('NORMATIVA') if 'NORMATIVA' in enc else None
+        out = {}
+        for f in filas[cab + 1:]:
+            cid = str(f[c_id]).strip().upper() if len(f) > c_id else ''
+            if not cid.startswith('DESREG'):
+                continue
+            partes = []
+            for etiqueta, c in (("Normativa", c_norm), ("Propuesta", c_prop), ("Resumen", c_res)):
+                if c is not None and c < len(f) and str(f[c]).strip():
+                    partes.append(f"{etiqueta}: {str(f[c]).strip()}")
+            if partes:
+                out[cid] = " | ".join(partes)[:1500]
+        print(f"  📚 Explicaciones de casos cargadas para la IA: {len(out)}.")
+        return out
+    except Exception as e:
+        print(f"  ⚠️  No se pudo leer la hoja '{HOJA_EXPLICACIONES}' (la IA sigue sin ese "
+              f"contexto): {e}")
+        return {}
+
+
 def confirmar_con_ia(id_caso, accion, desc_caso, texto_norma):
-    """Le pregunta a Gemini DOS cosas: si la norma coincide con el caso, y si además
-    lo DEROGA/MODIFICA/SUSTITUYE (afecta) o solo lo reglamenta/menciona.
-    Devuelve (coincide, afecta, razon). Cada bool puede ser None si la IA no pudo."""
+    """Le pide a Gemini un VEREDICTO sobre la relación entre la norma y el caso:
+      - "actua":  la norma ACTÚA sobre el objetivo del caso (lo deroga, modifica,
+                  sustituye, crea, disuelve o reglamenta). Exige citar la EVIDENCIA.
+      - "tema":   es del mismo tema/organismo pero no actúa sobre el objetivo.
+      - "no":     solo lo menciona, lo usa o comparte vocabulario.
+    Devuelve (veredicto, evidencia, razon); veredicto=None si la IA no respondió."""
     import json
     prompt = f"""Sos analista de políticas públicas de la Fundación Libertad y Progreso. \
-Seguimos una lista de normas y organismos que proponemos desregular (derogar, modificar, eliminar, crear o reglamentar).
+Seguimos normas y organismos que proponemos desregular. Un filtro de palabras clave marcó que la norma \
+publicada hoy en el Boletín Oficial podría tener que ver con UNO de nuestros casos. Tenés que decidir si \
+de verdad nos importa. Sé estricto: el filtro ya trae muchos falsos positivos.
 
-Te paso UN caso que seguimos (con la ACCIÓN que proponemos) y el TEXTO de una norma publicada hoy en el Boletín Oficial. \
-Respondé DOS cosas en un JSON:
+Clasificá la relación con UNO de estos veredictos:
 
-1) "coincide": true SOLO si la norma TIENE POR OBJETO actuar sobre la norma, el organismo o el régimen del caso \
-(modificarlo, derogarlo, sustituirlo, crearlo, disolverlo o reglamentarlo). \
-"coincide": false si solo MENCIONA, CITA, INVOCA, APLICA o USA eso como parte de otro trámite (lo cita como \
-fundamento, pide un dictamen, nombra al organismo como autor de un acto de rutina, o solo comparte tema/vocabulario). \
-Mencionar o usar NO es coincidir.
-
-2) "afecta": true si la norma DEROGA, MODIFICA, SUSTITUYE o ELIMINA la norma, el artículo o la obligación del caso \
-(cambia efectivamente sus reglas). "afecta": false si es del mismo tema pero NO la deroga ni la modifica (por ejemplo, \
-solo la REGLAMENTA, la aplica o la menciona). Si no podés determinarlo, poné "afecta": null.
+- "actua": la norma TIENE POR OBJETO cambiar el objetivo del caso, es decir, DEROGA, MODIFICA, SUSTITUYE, \
+CREA, DISUELVE o REGLAMENTA la norma, el régimen, la obligación o el organismo que figura como objetivo \
+del caso. Para elegir "actua" TENÉS que copiar en "evidencia" la frase textual de la norma (artículo o \
+considerando) que lo demuestra.
+- "tema": la norma es del mismo tema u organismo y vale la pena que un analista la mire, pero NO actúa \
+sobre el objetivo del caso (por ejemplo, regula otra cosa del mismo organismo).
+- "no": la norma solo MENCIONA, CITA o USA al organismo o la norma del caso como parte de otro trámite \
+(lo invoca como fundamento, le pide un dictamen o un informe, fija sueldos, bonificaciones, designaciones \
+o gastos de su personal, aprueba un acto de rutina) o solo comparte vocabulario.
 
 Ejemplos:
-- Caso: eliminar el "Tribunal de Tasaciones". Norma que le pide un dictamen de valor → coincide:false.
-- Caso: derogar el artículo sobre incumbencias profesionales de la Ley 26.522. Norma que REGLAMENTA esas \
-incumbencias → coincide:true, afecta:false (es del tema, pero no deroga ni modifica ese artículo).
-- La misma norma, pero que DEROGA o MODIFICA ese artículo → coincide:true, afecta:true.
+- Caso: eliminar el Tribunal de Tasaciones. Norma que usa un informe de valor del Tribunal para una \
+expropiación → "no".
+- Caso: modificar la ley de un organismo. Norma que fija bonificaciones al personal de ese organismo → "no".
+- Caso: simplificar un trámite de la IGJ. Norma de otro organismo que digitaliza otro trámite → "no" \
+(o "tema" si es la misma materia y vale la pena mirarla).
+- Caso: derogar un artículo de la Ley 26.522. Norma que REGLAMENTA ese artículo → "actua", con la \
+evidencia del artículo que lo reglamenta.
+
+Ante la duda entre "actua" y "tema", elegí "tema". Ante la duda entre "tema" y "no", elegí "no".
 
 CASO {id_caso} (acción que proponemos: {accion}):
 {desc_caso}
@@ -926,30 +1028,30 @@ NORMA DEL BOLETÍN:
 {texto_norma[:IA_MAX_CHARS_NORMA]}
 
 Respondé SOLO con un JSON válido, sin texto adicional:
-{{"coincide": true|false, "afecta": true|false|null, "razon": "<frase breve; si afecta=false aclará que solo lo reglamenta/menciona>"}}"""
+{{"veredicto": "actua"|"tema"|"no", "evidencia": "<cita textual breve de la norma, o vacío>", \
+"razon": "<una frase: qué hace la norma y por qué ese veredicto>"}}"""
     try:
         txt = _consultar_gemini(prompt).strip()
         m = re.search(r'\{.*\}', txt, re.DOTALL)
         if not m:
             # Respuesta sin JSON: incierto → None (se conserva para revisión manual).
-            return None, None, f"respuesta no interpretable: {txt[:120]}"
+            return None, "", f"respuesta no interpretable: {txt[:120]}"
         obj = json.loads(m.group(0))
-        if 'coincide' not in obj:
-            return None, None, f"sin campo coincide: {txt[:120]}"
-        coincide = bool(obj.get('coincide'))
-        afecta_raw = obj.get('afecta', None)
-        afecta = None if afecta_raw is None else bool(afecta_raw)
-        return coincide, afecta, str(obj.get('razon', ''))[:300]
+        veredicto = str(obj.get('veredicto', '')).strip().lower()
+        if veredicto not in ('actua', 'tema', 'no'):
+            return None, "", f"veredicto inválido: {txt[:120]}"
+        return (veredicto, str(obj.get('evidencia', '') or '').strip()[:300],
+                str(obj.get('razon', '') or '')[:300])
     except Exception as e:
-        return None, None, f"error: {e}"
+        return None, "", f"error: {e}"
 
 
 def confirmar_alertas_con_ia(alertas):
     """Revisa cada candidata con la IA. Devuelve (confirmadas, revisar, descartadas):
-      - confirmadas: del tema y (si es un caso de DEROGACIÓN) que además deroga/modifica.
-      - revisar: caso de DEROGACIÓN, del tema, pero la norma NO deroga ni modifica el
-        objetivo (solo lo reglamenta/menciona). No se descarta: va en gris/naranja.
-      - descartadas: no relacionadas.
+      - confirmadas: la norma actúa sobre el objetivo del caso, con evidencia textual.
+      - revisar: del mismo tema/organismo pero sin acción clara sobre el objetivo, o
+        "actúa" sin evidencia citada. No se descarta: va en naranja.
+      - descartadas: solo menciona/usa al organismo o comparte vocabulario.
     Ante un error/duda de la IA, NO se pierde la candidata (queda en 'confirmadas' con nota)."""
     if not GEMINI_API_KEY:
         msg = ("USAR_IA está activado pero falta GEMINI_API_KEY. Se envían las "
@@ -973,31 +1075,37 @@ def confirmar_alertas_con_ia(alertas):
 
     confirmadas, revisar, descartadas, errores = [], [], [], 0
     cuota_agotada = False
+    explicaciones = leer_explicaciones()
     for i, a in enumerate(a_revisar_ia):
-        es_derogacion = 'DEROG' in (a.get('ACCION') or '').upper()
+        expl = explicaciones.get(str(a['ID']).strip().upper(), '')
         desc = (f"Organismo: {a.get('ORGANISMO', '')}. "
                 f"Norma objetivo: {a.get('NUMERO_NORMA', '')}. "
-                f"Términos del caso: {', '.join(a['KEYWORDS_ENCONTRADAS'])}.")
-        coincide, afecta, razon = confirmar_con_ia(a['ID'], a['ACCION'], desc, a.get('TEXTO_NORMA', ''))
+                + (f"Qué proponemos: {expl}. " if expl else "")
+                + f"Términos que coincidieron: {', '.join(a['KEYWORDS_ENCONTRADAS'])}.")
+        veredicto, evidencia, razon = confirmar_con_ia(a['ID'], a['ACCION'], desc,
+                                                       a.get('TEXTO_NORMA', ''))
         # Cuota agotada: dejar de consultar la IA por el resto de la corrida.
-        if coincide is None and 'CUOTA' in (razon or '').upper():
+        if veredicto is None and 'CUOTA' in (razon or '').upper():
             cuota_agotada = True
             print(f"  🤖 {a['ID']}: 🚫 cuota de IA agotada — se deja de consultar por hoy")
             sin_revisar.extend(a_revisar_ia[i:])   # este y los que faltan quedan sin revisar
             break
         a['IA_RAZON'] = razon
-        if coincide is None:
+        if veredicto is None:
             errores += 1
             a['IA_RAZON'] = f"IA no disponible ({razon}); revisar manualmente"
             confirmadas.append(a); estado = "⚠️ sin respuesta"
-        elif not coincide:
+        elif veredicto == 'no':
             descartadas.append(a); estado = "✖ descarta"
-        elif es_derogacion and afecta is False:
-            a['IA_RAZON'] = razon or "es del tema pero no se identificó derogación ni modificación"
-            revisar.append(a); estado = "🔶 para revisar (sin derogación/modificación)"
-        else:
+        elif veredicto == 'actua' and len(evidencia) >= 15:
+            a['IA_RAZON'] = f"{razon} — Evidencia: «{evidencia}»"
             confirmadas.append(a); estado = "✅ confirma"
-        print(f"  🤖 {a['ID']}: {estado} — {razon}")
+        else:
+            # "tema", o "actua" sin evidencia textual: no se pierde, va a revisar.
+            if veredicto == 'actua':
+                a['IA_RAZON'] = f"{razon} (la IA no citó evidencia textual)"
+            revisar.append(a); estado = "🔶 para revisar"
+        print(f"  🤖 {a['ID']}: {estado} — {a['IA_RAZON']}")
         time.sleep(IA_DELAY_SEGUNDOS)
 
     # Candidatas no revisadas por IA (tope por caso/total o cuota): se conservan
@@ -1068,7 +1176,7 @@ def construir_html_listado(normas):
         """
 
         for norma in lista:
-            titulo = norma['TEXTO'][:140]
+            titulo = _html.escape(norma['TEXTO'][:140])
             if len(norma['TEXTO']) > 140:
                 titulo += "..."
 
@@ -1109,8 +1217,13 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
         nota_fuente = ("""
         <p style="background:#fef9e7; border:1px solid #f39c12; border-radius:4px;
                   padding:8px 12px; font-size:12px; color:#7d6608; margin:0 0 10px 0;">
-            ⚠️ Vigía no estaba disponible o actualizada hoy: se usó el scraping directo del
-            BORA (fuente de respaldo). El resultado es válido; solo cambió la fuente del listado.
+            ⚠️ Vigía no estaba disponible o actualizada hoy: se leyó el BORA directamente
+            (fuente de respaldo). El resultado es válido; solo cambió la fuente del listado.
+        </p>""")
+    if BORA_PROXY_URL:
+        nota_fuente += ("""
+        <p style="color:#95a5a6; font-size:11px; margin:0 0 10px 0;">
+            Lectura del BORA a través del intermediario de Cloudflare (bora-proxy-sam).
         </p>""")
 
     cuerpo = f"""
@@ -1148,10 +1261,10 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
                     Otras keywords: {', '.join(a['KEYWORDS_ENCONTRADAS'])}
                 </p>
                 <p style="margin: 3px 0; font-size: 13px; color: #16a085;">
-                    {('🤖 <b>IA:</b> ' + a['IA_RAZON']) if a.get('IA_RAZON') else ''}
+                    {('🤖 <b>IA:</b> ' + _html.escape(a['IA_RAZON'])) if a.get('IA_RAZON') else ''}
                 </p>
                 <p style="margin: 3px 0; font-size: 13px;">
-                    <b>Título:</b> {a['TITULO']}
+                    <b>Título:</b> {_html.escape(a['TITULO'])}
                 </p>
                 <p style="margin: 5px 0 0 0;">
                     <a href='{a['URL']}' style="font-size: 12px;">🔗 Leer norma completa</a>
@@ -1169,18 +1282,18 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
         </p>
         """
 
-    # Para revisar: casos de DEROGACIÓN del tema pero donde la IA no vio derogación
-    # ni modificación (solo reglamentación/mención). No se descartan: van en naranja.
+    # Para revisar: del tema del caso, pero la IA no vio (con evidencia) que la norma
+    # actúe sobre el objetivo. No se descartan: van en naranja.
     if revisar_ia:
         cuerpo += f"""
         <div style="background-color:#fef5e7; border:1px solid #e67e22;
                     border-radius:6px; padding:12px 15px; margin:15px 0;">
             <h4 style="color:#ca6f1e; margin:0 0 8px 0;">
-                🔶 {len(revisar_ia)} para revisar — relacionadas pero sin derogación/modificación clara
+                🔶 {len(revisar_ia)} para revisar — del tema, sin acción clara sobre el caso
             </h4>
             <p style="color:#7f8c8d; font-size:12px; margin-top:0;">
-                Son del tema de un caso de derogación, pero la IA no detectó que la norma
-                derogue ni modifique el objetivo (podría solo reglamentarlo o mencionarlo).
+                Son del mismo tema u organismo que un caso, pero la IA no encontró evidencia
+                de que la norma derogue, modifique, cree o reglamente el objetivo del caso.
                 Revisalas por las dudas.
             </p>
         """
@@ -1188,8 +1301,8 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
             cuerpo += f"""
             <div style="margin:8px 0 8px 10px; font-size:12px; color:#5d6d7e;">
                 <b>{r['ID']}</b> — Acción: {r['ACCION']}<br>
-                {r['TITULO']}<br>
-                🤖 {r.get('IA_RAZON', '')}
+                {_html.escape(r['TITULO'])}<br>
+                🤖 {_html.escape(r.get('IA_RAZON', ''))}
                 — <a href='{r['URL']}' style="font-size:11px;">ver norma</a>
             </div>
             """
@@ -1211,8 +1324,8 @@ def construir_email_completo(alertas, normas_ignoradas, listado_html="", descart
         for d in descartadas_ia:
             cuerpo += f"""
             <div style="margin: 6px 0 6px 10px; font-size: 12px; color: #7f8c8d;">
-                <b>{d['ID']}</b> — {d['TITULO']}<br>
-                🤖 {d.get('IA_RAZON', '')}
+                <b>{d['ID']}</b> — {_html.escape(d['TITULO'])}<br>
+                🤖 {_html.escape(d.get('IA_RAZON', ''))}
                 — <a href='{d['URL']}' style="font-size: 11px;">ver norma</a>
             </div>
             """
@@ -1258,7 +1371,7 @@ def enviar_html(asunto: str, cuerpo_html: str) -> bool:
         server.login(EMAIL_ORIGEN, PASSWORD_APP)
         server.sendmail(EMAIL_ORIGEN, destinatarios, msg.as_string())
         server.quit()
-        print(f"✅ Email enviado a: {', '.join(destinatarios)}")
+        print(f"✅ Email enviado a {len(destinatarios)} destinatario(s).")
         return True
     except Exception as e:
         print(f"❌ Error al enviar email: {e}")
